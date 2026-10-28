@@ -87,6 +87,10 @@ class TextToSpeech:
                 last_exc = exc
                 log.warning("Попытка %d: инициализация TTS не удалась: %s",
                             attempt + 1, self._com_error_text(exc))
+                # Если причина — отсутствие установленного голоса (hr 0x80040212),
+                # повторные попытки бессмысленны: выходим сразу с понятной подсказкой.
+                if self._looks_like_no_voices(exc):
+                    break
                 time.sleep(0.4)
 
         sapi_hint = self._diagnose_sapi()
@@ -95,8 +99,20 @@ class TextToSpeech:
         self._init_error = combined
         log.error("Синтез речи недоступен (%s). Голосовые ответы будут выводиться текстом.",
                   combined)
+        print("Голосовой синтез недоступен:", combined or "причина неизвестна")
+        print("Ответы продолжат печататься текстом; для голоса установите пакет речи")
+        print("Windows: Параметры → Время и язык → Речь → Добавить голоса.")
         self.engine = None
         self.available = False
+
+    @staticmethod
+    def _looks_like_no_voices(exc: BaseException) -> bool:
+        """COMError -2147201006 (0x80040212) = SAPI_E_NONAMES — нет ни одного голоса."""
+        args = getattr(exc, "args", ()) or ()
+        if args and isinstance(args[0], int) and args[0] in (-2147201006, 0x80040212):
+            return True
+        text = str(exc).lower()
+        return "0x80040212" in text or "-2147201006" in text
 
     # ------------------------------------------------------------------
     def _iter_voices(self) -> list:

@@ -26,6 +26,20 @@ if not defined VA_CRLF_CHECK (
 rem --- always work from the folder where this script lives
 set "ROOT=%~dp0"
 if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+
+rem --- fix UTF-8 report encoding on Windows 7 / PowerShell 2.0/3.0,
+rem --- where Out-File -Encoding utf8 writes BOM and cmd.exe redirection
+rem --- writes OEM bytes (that produced unreadable mojibake in the report).
+for /f "tokens=2 delims==" %%v in ('wmic os get Version /value 2^>nul ^| findstr Version') do set "WINVER=%%v"
+for /f "delims=. tokens=1" %%m in ("%WINVER%") do set "WINMAJOR=%%m"
+if not defined WINMAJOR for /f "delims=. tokens=1" %%m in ("%WINVER:~0,6%") do set "WINMAJOR=%%m"
+if "%WINMAJOR%" geq 10 (
+    rem PowerShell 5+: console output is already UTF-8, redirection is safe.
+    set "REPORT_ENC="
+) else (
+    rem Old PowerShell: write files explicitly via .NET (no BOM, UTF-8).
+    set "REPORT_ENC=-Command $OutputEncoding=[Text.Encoding]::UTF8; [Console]::InputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8"
+)
 cd /d "%ROOT%" || (
     echo FAILED: cannot enter project folder "%ROOT%"
     pause
@@ -36,6 +50,12 @@ set "VENV_PY=%ROOT%\.venv\Scripts\python.exe"
 set "LOG_DIR=%ROOT%\logs"
 set "REPORT=%LOG_DIR%\check_report.txt"
 if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" 2>nul
+
+rem --- force UTF-8 for every python child process: without this, on the
+rem --- default OEM code page (866) Russian output becomes mojibake both in
+rem --- the console and in the saved report file.
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 
 if not defined VA_CHECK_LOGGING (
     set "VA_CHECK_LOGGING=1"
@@ -224,7 +244,7 @@ rem ---------- [9] Recent errors from log ----------
 echo.
 echo [9/10] Last errors from logs\app.log...
 if exist "%LOG_DIR%\app.log" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Content -LiteralPath '%LOG_DIR%\app.log' -Encoding UTF8 -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15" > "%TEMP%\va_log_tail.txt" 2>&1
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Content -LiteralPath '%LOG_DIR%\app.log' -Encoding UTF8 -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15 | Out-File -FilePath '%TEMP%\va_log_tail.txt' -Encoding utf8" >nul 2>&1
     type "%TEMP%\va_log_tail.txt"
     del "%TEMP%\va_log_tail.txt" >nul 2>&1
     echo       Full log: %LOG_DIR%\app.log ^(UTF-8; if console shows mojibake, open the file in Notepad^)
