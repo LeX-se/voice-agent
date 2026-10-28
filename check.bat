@@ -242,7 +242,7 @@ rem ---------- [9] Recent errors from log ----------
 echo.
 echo [9/10] Last errors from logs\app.log...
 if exist "%LOG_DIR%\app.log" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Content -LiteralPath '%LOG_DIR%\app.log' -Encoding UTF8 -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15 | Out-File -FilePath '%TEMP%\va_log_tail.txt' -Encoding utf8" >nul 2>&1
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = @(Get-Content -LiteralPath '%LOG_DIR%\app.log' -Encoding UTF8 -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15 | ForEach-Object { $_.Line }); [IO.File]::WriteAllLines([Text.Encoding]::UTF8, '%TEMP%\va_log_tail.txt', $t)" >nul 2>&1
     type "%TEMP%\va_log_tail.txt"
     del "%TEMP%\va_log_tail.txt" >nul 2>&1
     echo       Full log: %LOG_DIR%\app.log ^(UTF-8; if console shows mojibake, open the file in Notepad^)
@@ -265,84 +265,6 @@ if errorlevel 1 (
     echo       OK: the application started, answered and exited cleanly.
 )
 :oneq_done
-
-:summary
-)
-echo       OK: Ollama is running. Models:
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; try { $m = Invoke-RestMethod -Uri 'http://localhost:11434/api/tags' -TimeoutSec 3; $m.models | ForEach-Object { Write-Output ('        - ' + $_.name) } } catch { }" 2>nul
-
-rem ---------- [7] TTS voices ----------
-echo.
-echo [7/10] Text-to-speech voices...
-if defined RUN_PY goto :tts_run
-echo       SKIP: no python available.
-goto :tts_done
-:tts_run
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = @'
-import sys, os
-sys.path.insert(0, os.environ['VA_ROOT'])
-from app.tts import TextToSpeech
-t = TextToSpeech()
-print('      TTS available:', t.available)
-print('      Voice:', t.voice_name or '(none)')
-voices = t.list_voices()
-print('      Voices in Windows:', len(voices))
-for n, i in voices[:10]:
-    print('        -', n)
-if not t.available and t.error:
-    print('      Reason:', t.error)
-'@; $f = Join-Path $env:TEMP 'va_tts_test.py'; [IO.File]::WriteAllText($f, $c); & '%RUN_PY%' -X utf8 $f; $rc = $LASTEXITCODE; Remove-Item $f -ErrorAction SilentlyContinue; exit $rc" 2>&1
-:tts_done
-
-rem ---------- [8] App self-test ----------
-echo.
-echo [8/10] Application modules self-test...
-if defined RUN_PY goto :selftest_run
-echo       SKIP: no python available.
-goto :selftest_done
-:selftest_run
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = @'
-import sys, os
-sys.path.insert(0, os.environ['VA_ROOT'])
-from app import config, utils, storage, search, llm, tts
-print('      Imports OK')
-print('      DB path:', config.DB_PATH)
-print('      Log path:', config.APP_LOG_PATH)
-import app.main
-print('      main.py loads OK (direct-run fix active)')
-'@; $f = Join-Path $env:TEMP 'va_selftest.py'; [IO.File]::WriteAllText($f, $c); & '%RUN_PY%' -X utf8 $f; $rc = $LASTEXITCODE; Remove-Item $f -ErrorAction SilentlyContinue; exit $rc" 2>&1
-if errorlevel 1 (
-    echo       FAILED: application modules cannot be imported. See lines above.
-    set /a FAILCOUNT+=1
-)
-:selftest_done
-
-rem ---------- [9] Recent errors from log ----------
-echo.
-echo [9/10] Last errors from logs\app.log...
-if exist "%LOG_DIR%\app.log" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Content -LiteralPath '%LOG_DIR%\app.log' -Encoding UTF8 -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15 | Out-File -FilePath '%TEMP%\va_log_tail.txt' -Encoding utf8" >nul 2>&1
-    type "%TEMP%\va_log_tail.txt"
-    del "%TEMP%\va_log_tail.txt" >nul 2>&1
-    echo       Full log: %LOG_DIR%\app.log ^(UTF-8; if console shows mojibake, open the file in Notepad^)
-) else (
-    echo       No log file yet ^(app was never started successfully^).
-)
-
-rem ---------- [10] One-shot question test ----------
-echo.
-echo [10/10] Running the app with a single test question...
-if not defined RUN_PY (
-    echo       SKIP: no python available.
-) else (
-    "%RUN_PY%" -X utf8 "%ROOT%\app\main.py" "What is the name of this project" 2>&1
-    if errorlevel 1 (
-        echo       FAILED: the application returned an error code. See lines above.
-        set /a FAILCOUNT+=1
-    ) else (
-        echo       OK: the application started, answered and exited cleanly.
-    )
-)
 
 :summary
 rem ---------- Summary ----------
