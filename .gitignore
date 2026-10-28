@@ -5,3 +5,6 @@ __pycache__/
 *.pyc
 models/
 *.bundle
+mock.pid
+run2.log
+.venv*/

@@ -1,85 +1,98 @@
 @echo off
+setlocal EnableExtensions EnableDelayedExpansion
 rem ============================================================
-rem  Voice Agent - установка окружения (запустите этот файл один раз)
+rem  Voice Agent - installer
+rem  Creates .venv and installs dependencies.
+rem  Console messages are English on purpose (see README.md).
 rem ============================================================
-chcp 65001 >nul
-cd /d "%~dp0"
 
-echo Установка локального голосового агента...
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
+cd /d "%ROOT%" || (
+    echo FAILED: cannot enter project folder "%ROOT%"
+    pause
+    exit /b 1
+)
+
+echo ============================================================
+echo  Voice Agent - installation
+echo  Folder: %ROOT%
+echo ============================================================
 echo.
 
-rem --- Поиск Python 3.11 (или любого Python 3.x как запасного варианта) ---
-set "PY_CMD="
-py -3.11 --version >nul 2>&1
-if not errorlevel 1 (
-    set "PY_CMD=py -3.11"
-    goto :python_found
+rem ---------- [1/4] find Python ----------
+echo [1/4] Looking for Python...
+set "BASE_PY="
+for /f "delims=" %%p in ('py -3.11 -c "import sys;print(sys.executable)" 2^>nul') do if not defined BASE_PY set "BASE_PY=%%p"
+if not defined BASE_PY for /f "delims=" %%p in ('py -3 -c "import sys;print(sys.executable)" 2^>nul') do if not defined BASE_PY set "BASE_PY=%%p"
+if not defined BASE_PY for /f "delims=" %%p in ('python -c "import sys;print(sys.executable)" 2^>nul') do if not defined BASE_PY set "BASE_PY=%%p"
+if not defined BASE_PY (
+    echo ERROR: Python was not found on this computer.
+    echo Install Python 3.11 from https://www.python.org/downloads/
+    echo IMPORTANT: tick "Add python.exe to PATH" during installation.
+    pause
+    exit /b 1
 )
-python --version >nul 2>&1
-if not errorlevel 1 (
-    set "PY_CMD=python"
-    goto :python_found
-)
-py -3 --version >nul 2>&1
-if not errorlevel 1 (
-    set "PY_CMD=py -3"
-    goto :python_found
-)
+echo       Found: !BASE_PY!
+"!BASE_PY!" --version
 
-echo ОШИБКА: Python не найден.
-echo Установите Python 3.11 (64-bit) с сайта https://www.python.org/downloads/
-echo При установке обязательно отметьте галочку "Add Python to PATH".
-echo После установки запустите install.bat снова.
-pause
-exit /b 1
-
-:python_found
-echo Найден Python: 
-%PY_CMD% --version
-
-rem --- Создание виртуального окружения, если его нет ---
-if not exist ".venv\Scripts\python.exe" (
-    echo Создаю виртуальное окружение .venv ...
-    %PY_CMD% -m venv ".venv"
+rem ---------- [2/4] create virtual environment ----------
+echo.
+echo [2/4] Creating virtual environment .venv ...
+if exist "%ROOT%\.venv\Scripts\python.exe" (
+    echo       .venv already exists - reusing it.
+) else (
+    "!BASE_PY!" -m venv "%ROOT%\.venv"
     if errorlevel 1 (
-        echo ОШИБКА: не удалось создать виртуальное окружение.
-        echo Подробности выше. Обратитесь за помощью или повторите установку.
+        echo ERROR: failed to create the virtual environment.
         pause
         exit /b 1
     )
 )
-
-rem --- Активация окружения ---
-call ".venv\Scripts\activate.bat"
+set "VPY=%ROOT%\.venv\Scripts\python.exe"
+"!VPY!" -c "print(1)" >nul 2>&1
 if errorlevel 1 (
-    echo ОШИБКА: не удалось активировать виртуальное окружение.
+    echo ERROR: .venv was created but its python.exe does not run.
+    echo Delete the ".venv" folder and run install.bat again.
     pause
     exit /b 1
 )
 
-rem --- Обновление pip и установка зависимостей ---
-echo Обновляю pip...
-python -m pip install --upgrade pip
+rem ---------- [3/4] install dependencies ----------
+echo.
+echo [3/4] Installing dependencies ^(may take a few minutes^)...
+"!VPY!" -m pip install --upgrade pip
 if errorlevel 1 (
-    echo ОШИБКА: не удалось обновить pip. Проверьте подключение к интернету
-    echo (это единственное сетевое действие установки) и повторите запуск.
+    echo WARNING: could not upgrade pip, continuing anyway...
+)
+"!VPY!" -m pip install -r "%ROOT%\requirements.txt"
+if errorlevel 1 (
+    echo ERROR: dependency installation failed.
+    echo Check your internet connection and run install.bat again.
     pause
     exit /b 1
 )
 
-echo Устанавливаю зависимости из requirements.txt ...
-python -m pip install -r requirements.txt
+rem ---------- [4/4] verify ----------
+echo.
+echo [4/4] Verifying installation...
+"!VPY!" -c "import requests, sounddevice, numpy, vosk, pyttsx3; print('      All packages import OK')"
 if errorlevel 1 (
-    echo ОШИБКА: не удалось установить зависимости.
-    echo Текст ошибки находится выше. Повторите запуск install.bat
-    echo или передайте этот экран тому, кто помогал с установкой.
+    echo ERROR: some packages are missing after installation.
+    echo Scroll up to see which package failed, then run install.bat again.
     pause
     exit /b 1
 )
 
 echo.
 echo ============================================================
-echo  Установка завершена успешно!
-echo  Теперь дважды щёлкните по файлу start.bat
+echo  Installation completed successfully!
+echo  Next steps:
+echo   1. Make sure Ollama is installed and running ^(ollama.com^)
+echo      and a model is pulled, e.g.:  ollama pull qwen2.5:3b
+echo   2. Optional: extract a Vosk Russian model into models\
+echo     ^(download from https://alphacephei.com/vosk/models^).
+echo   3. Double-click start.bat
 echo ============================================================
 pause
+exit /b 0

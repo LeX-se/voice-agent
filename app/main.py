@@ -1,14 +1,27 @@
 """Главный модуль голосового агента: статус, команды, главный цикл."""
 
+import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
 
-from . import config, llm, search, storage
-from .stt import SpeechToText
-from .tts import TextToSpeech
-from .utils import log, parse_quoted_argument
+if __package__ in (None, ""):
+    # Прямой запуск файла ("python app\\main.py" или "python C:\\...\\app\\main.py")
+    # ломает относительные импорты. Добавляем корень проекта в sys.path и
+    # импортируем пакет целиком — так main.py работает при любом способе запуска.
+    _ROOT = str(Path(__file__).resolve().parent.parent)
+    if _ROOT not in sys.path:
+        sys.path.insert(0, _ROOT)
+    from app import config, llm, search, storage  # type: ignore[no-redef]
+    from app.stt import SpeechToText  # type: ignore[no-redef]
+    from app.tts import TextToSpeech  # type: ignore[no-redef]
+    from app.utils import log, parse_quoted_argument  # type: ignore[no-redef]
+else:
+    from . import config, llm, search, storage
+    from .stt import SpeechToText
+    from .tts import TextToSpeech
+    from .utils import log, parse_quoted_argument
 
 
 HELP_TEXT = """
@@ -375,6 +388,17 @@ class VoiceAgentApp:
     # Главный цикл (раздел 15 ТЗ)
     # ------------------------------------------------------------------
     def run(self) -> None:
+        # Самовосстановление: работаем от корня проекта (там, где папка app),
+        # независимо от текущей папки запуска; гарантируем наличие data/logs/knowledge.
+        try:
+            os.chdir(str(config.PROJECT_ROOT))
+        except OSError:
+            pass
+        for d in (config.DATA_DIR, config.LOGS_DIR, config.KNOWLEDGE_DIR):
+            try:
+                Path(d).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
         self.startup()
         running = True
         while running:
@@ -414,9 +438,19 @@ class VoiceAgentApp:
         log.info("Приложение завершено")
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    args = list(sys.argv[1:] if argv is None else argv)
+
+    # Режим проверки: python app\main.py "Как называется проект?" —
+    # отвечает на один вопрос и завершается. Удобно для диагностики.
+    one_shot = len(args) == 1 and not args[0].startswith("/")
     app = VoiceAgentApp()
     try:
+        if one_shot:
+            app.startup()
+            app.process_question(args[0])
+            app.shutdown()
+            return 0
         app.run()
     except Exception as exc:  # noqa: BLE001 — последний рубеж: логируем, не показываем трейс
         log.exception("Непредвиденная ошибка: %s", exc)
