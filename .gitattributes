@@ -1,0 +1,7 @@
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.py text eol=lf
+*.txt text
+*.md text
+*.json text
+*.db binary
