@@ -1,5 +1,7 @@
 """Синтез речи через Windows SAPI5 (pyttsx3). Движок инициализируется один раз."""
 
+import time
+
 from . import config
 from .utils import clean_for_speech, log
 
@@ -18,18 +20,83 @@ class TextToSpeech:
         self.voice_id = ""
         self.used_default_voice = False
         self._init_error = ""
+        self._pyttsx3 = None
+        self._init_engine()
 
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _com_error_text(exc: BaseException) -> str:
+        """Извлекает человекочитаемое описание из COMError (ctypes/pycaw)."""
+        parts = []
+        for arg in getattr(exc, "args", ()) or ():
+            if isinstance(arg, str) and arg.strip():
+                parts.append(arg.strip())
+            elif isinstance(arg, tuple):
+                parts.extend(str(x) for x in arg if isinstance(x, str) and x.strip())
+        text = " | ".join(dict.fromkeys(parts))
+        return text or str(exc)
+
+    def _diagnose_sapi(self) -> str:
+        """Прямая проверка SAPI через comtypes: возвращает текст ошибки или ''."""
+        try:
+            import comtypes.client  # noqa: F401
+            sp = comtypes.client.CreateObject("SAPI.SpVoice")
+            voices = sp.GetVoices()
+            count = int(voices.Count)
+            if count == 0:
+                return ("В Windows не установлено ни одного голоса TTS. "
+                        "Установите голос: Параметры → Время и язык → Речь → "
+                        "Добавить голоса (например, Microsoft Irina Desktop).")
+            return ""
+        except Exception as exc:  # noqa: BLE001
+            return self._com_error_text(exc)
+
+    def _init_engine(self) -> None:
+        """Инициализация pyttsx3/sapi5 с повтором и понятной диагностикой."""
         try:
             import pyttsx3  # локальный импорт: модуль может отсутствовать на других ОС
-            self.engine = pyttsx3.init(driverName="sapi5")
-            self.engine.setProperty("rate", config.TTS_RATE)
-            self._select_voice()
-            self.available = True
-        except Exception as exc:  # noqa: BLE001 — любой сбой TTS не должен ронять приложение
+        except Exception as exc:  # noqa: BLE001
             self._init_error = str(exc)
-            log.exception("Синтез речи недоступен: %s", exc)
-            self.engine = None
-            self.available = False
+            log.error("Модуль pyttsx3 не установлен: %s", exc)
+            return
+
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                # Известный баг pyttsx3 (issue #398): глобальный weakref-кэш
+                # _activeEngines при повторных init() в одном процессе иногда
+                # содержит нерабочую ссылку -> KeyError/COMError. Чистим кэш
+                # перед каждой попыткой.
+                engines = getattr(pyttsx3, "_activeEngines", None)
+                if engines is not None:
+                    try:
+                        engines.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+                engine = pyttsx3.init(driverName="sapi5")
+                # Проверка работоспособности движка: getProperty("voice") бросает
+                # COMError (-2147201006), если SAPI не может выбрать голос.
+                engine.getProperty("voice")
+                engine.setProperty("rate", config.TTS_RATE)
+                self._pyttsx3 = pyttsx3
+                self.engine = engine
+                self._select_voice()
+                self.available = True
+                return
+            except Exception as exc:  # noqa: BLE001 — любой сбой TTS не роняет приложение
+                last_exc = exc
+                log.warning("Попытка %d: инициализация TTS не удалась: %s",
+                            attempt + 1, self._com_error_text(exc))
+                time.sleep(0.4)
+
+        sapi_hint = self._diagnose_sapi()
+        detail = self._com_error_text(last_exc) if last_exc else ""
+        combined = "; ".join(p for p in (detail, sapi_hint) if p)
+        self._init_error = combined
+        log.error("Синтез речи недоступен (%s). Голосовые ответы будут выводиться текстом.",
+                  combined)
+        self.engine = None
+        self.available = False
 
     # ------------------------------------------------------------------
     def _iter_voices(self) -> list:

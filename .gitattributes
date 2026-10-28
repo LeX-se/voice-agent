@@ -5,3 +5,4 @@
 *.md text
 *.json text
 *.db binary
+TZ.md text eol=crlf

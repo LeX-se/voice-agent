@@ -6,6 +6,15 @@ import sys
 import time
 from pathlib import Path
 
+if hasattr(sys.stdout, "reconfigure"):
+    # Windows: консоли с кодовой страницей 866/1251 иначе ломают кириллицу
+    # при перенаправлении вывода (отчёт check.bat, last_run.log).
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
+
 if __package__ in (None, ""):
     # Прямой запуск файла ("python app\\main.py" или "python C:\\...\\app\\main.py")
     # ломает относительные импорты. Добавляем корень проекта в sys.path и

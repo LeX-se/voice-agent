@@ -113,6 +113,12 @@ class SpeechToText:
                     data, overflowed = stream.read(samples_per_block)
                     if overflowed:
                         log.warning("Переполнение аудиопотока")
+                    # sounddevice (CFFI backend) возвращает buffer-объект cffi,
+                    # а не bytes. Vosk (ctypes) принимает только bytes/bytearray:
+                    # TypeError "initializer for ctype 'char *' must be a cdata
+                    # pointer, not _cffi_backend.buffer". Нормализуем в bytes.
+                    if not isinstance(data, bytes):
+                        data = bytes(data)
                     buf = np.frombuffer(data, dtype=np.int16)
                     rms = _rms(buf)
 

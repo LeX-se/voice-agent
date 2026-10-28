@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
+chcp 65001 >nul
 rem ============================================================
 rem  check.bat - diagnostics for the voice agent setup.
 rem  Run this if install.bat or start.bat fail.
@@ -114,8 +115,30 @@ echo [4/10] Microphone ^(sounddevice^)...
 if not exist "%VENV_PY%" (
     echo       SKIP: no .venv.
 ) else (
-    "%VENV_PY%" -c "import sounddevice as sd; d=[x for x in sd.query_devices() if x['max_input_channels']>0]; print('      Input devices:', len(d)); [print('        ['+str(i)+']', x['name']) for i,x in enumerate(d)]" 2>&1
-    if errorlevel 1 echo       FAILED: sounddevice cannot list devices. Check microphone privacy settings in Windows.
+    set "MIC_TEST=%TEMP%\va_mic_test.py"
+    > "!MIC_TEST!" echo import sounddevice as sd
+    >> "!MIC_TEST!" echo devs = list(sd.query_devices^(^))
+    >> "!MIC_TEST!" echo ins = [x for x in devs if x['max_input_channels'] ^> 0]
+    >> "!MIC_TEST!" echo print('      Input devices:', len(ins^)^)
+    >> "!MIC_TEST!" echo try:
+    >> "!MIC_TEST!" echo     default_in = sd.default.device[0]
+    >> "!MIC_TEST!" echo except Exception:
+    >> "!MIC_TEST!" echo     default_in = -1
+    >> "!MIC_TEST!" echo for i, x in enumerate(devs^):
+    >> "!MIC_TEST!" echo     if x['max_input_channels'] ^> 0:
+    >> "!MIC_TEST!" echo         mark = ''
+    >> "!MIC_TEST!" echo         if i == default_in:
+    >> "!MIC_TEST!" echo             mark = '   ^<-- DEFAULT'
+    >> "!MIC_TEST!" echo         name = x['name'].splitlines^(^)[0]
+    >> "!MIC_TEST!" echo         print('        [' + str(i^) + '] ' + name + mark^)
+    >> "!MIC_TEST!" echo try:
+    >> "!MIC_TEST!" echo     sd.check_input_status^(^)
+    >> "!MIC_TEST!" echo     print('      Windows microphone access: ALLOWED'^)
+    >> "!MIC_TEST!" echo except Exception:
+    >> "!MIC_TEST!" echo     print('      FAILED: Windows denies microphone access to desktop apps.'^)
+    >> "!MIC_TEST!" echo     print('      Fix: Settings - Privacy - Microphone - allow desktop apps.'^)
+    "!VENV_PY!" -X utf8 "!MIC_TEST!" 2>&1
+    del "!MIC_TEST!" >nul 2>&1
 )
 
 rem ---------- [5] Vosk model ----------
@@ -145,7 +168,7 @@ if exist "%VENV_PY%" (
 )
 if not defined OLLAMA_OK (
     echo       FAILED: cannot reach Ollama at http://localhost:11434
-    echo       Fix: install Ollama from https://ollama.com/download and run: ollama pull llama3.1
+    echo       Fix: install Ollama from https://ollama.com/download and run: ollama pull qwen2.5:3b
     echo       Check that the Ollama icon is present in the system tray.
     set /a FAILCOUNT+=1
     goto :ollama_done
@@ -161,8 +184,21 @@ echo [7/10] Text-to-speech voices...
 if not exist "%VENV_PY%" (
     echo       SKIP: no .venv.
 ) else (
-    "%VENV_PY%" -c "import pyttsx3; e=pyttsx3.init(); names=[v.name for v in e.getProperty('voices') or []]; print('      Voices available:', len(names)); [print('        -', n) for n in names[:10]]; e.stop()" 2>&1
-    if errorlevel 1 echo       WARN: pyttsx3 failed to initialize. Voice output may be unavailable; text answers still work.
+    set "TTS_TEST=%TEMP%\va_tts_test.py"
+    > "!TTS_TEST!" echo import sys
+    >> "!TTS_TEST!" echo sys.path.insert(0, r'%ROOT%')
+    >> "!TTS_TEST!" echo from app.tts import TextToSpeech
+    >> "!TTS_TEST!" echo t = TextToSpeech^(^)
+    >> "!TTS_TEST!" echo print('      TTS available:', t.available^)
+    >> "!TTS_TEST!" echo print('      Voice:', t.voice_name or '(none)'^)
+    >> "!TTS_TEST!" echo voices = t.list_voices^(^)
+    >> "!TTS_TEST!" echo print('      Voices in Windows:', len(voices^)^)
+    >> "!TTS_TEST!" echo for n, i in voices[:10]:
+    >> "!TTS_TEST!" echo     print('        -', n^)
+    >> "!TTS_TEST!" echo if not t.available and t.error:
+    >> "!TTS_TEST!" echo     print('      Reason:', t.error^)
+    "!VENV_PY!" -X utf8 "!TTS_TEST!" 2>&1
+    del "!TTS_TEST!" >nul 2>&1
 )
 
 rem ---------- [8] App self-test ----------
@@ -188,8 +224,10 @@ rem ---------- [9] Recent errors from log ----------
 echo.
 echo [9/10] Last errors from logs\app.log...
 if exist "%LOG_DIR%\app.log" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Content -LiteralPath '%LOG_DIR%\app.log' -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15" 2>nul
-    echo       Full log: %LOG_DIR%\app.log
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; Get-Content -LiteralPath '%LOG_DIR%\app.log' -Encoding UTF8 -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15" > "%TEMP%\va_log_tail.txt" 2>&1
+    type "%TEMP%\va_log_tail.txt"
+    del "%TEMP%\va_log_tail.txt" >nul 2>&1
+    echo       Full log: %LOG_DIR%\app.log ^(UTF-8; if console shows mojibake, open the file in Notepad^)
 ) else (
     echo       No log file yet ^(app was never started successfully^).
 )
