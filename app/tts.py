@@ -150,15 +150,12 @@ class TextToSpeech:
                           self._com_error_text(exc))
             # При баге #412 runAndWait() возвращается мгновенно, хотя движок
             # ещё говорит. Не даём потоку завершиться раньше реального
-            # окончания произнесения: сначала дождаться события started, затем
-            # «простоять» остаток фразы (grace), чтобы следующая попытка не
-            # упёрлась в «run loop already started» и не пересоздала движок.
+            # окончания произнесения: ждём событие started, затем событие
+            # completed от SAPI (штатный признак конца фразы). Оценка по
+            # числу слов — только запасной путь, если completed не приходит;
+            # она ограничена сверху, чтобы не «спать» десятками секунд.
             if spoke is not None and finished is not None:
                 spoke.wait(timeout=getattr(config, "TTS_SPEAK_TIMEOUT", 90))
-                # Оцениваем реальную длительность фразы (скорость речи ~5.5
-                # слов/сек при TTS_RATE 175) и ждём её окончания с запасом,
-                # но НЕ фиксированные десятки секунд — иначе озвучка коротких
-                # ответов искусственно замедлялась бы до 30 с.
                 words = max(len(text.split()), 1)
                 est = words / 5.5 + 1.0
                 if not finished.is_set():
@@ -226,17 +223,25 @@ class TextToSpeech:
         if not spoke_ev.is_set() and can_detect["yes"]:
             spoke_ev.wait(0.3)
 
-        # Голос заговорил: даём произнесению штатно завершиться (до
-        # TTS_SPEAK_FINISH_GRACE секунд), иначе при раннем stop() следующая
-        # фраза упиралась бы в «run loop already started» и движок зря
-        # пересоздавался (лишние секунды между ответами).
+        # Голос заговорил: ждём окончания РЕАЛЬНОГО произнесения по событию
+        # 'completed' движка SAPI (а не по оценке длительности текста).
+        # Фиксированное ожидание до TTS_SPEAK_FINISH_GRACE секунд — именно оно
+        # создавало паузы 60–120 с между ответами: worker после бага #412
+        # возвращался мгновенно, но «дожидаться конца фразы» он умел только
+        # вслепую. Теперь: completed → возврат сразу; нет completed (движок
+        # не прислал событие) → короткое окно TTS_END_WAIT_SECONDS.
         if result["spoke"] and not done.is_set():
-            done.wait(timeout=getattr(config, "TTS_SPEAK_FINISH_GRACE", 120))
+            words = max(len(speech_text.split()), 1)
+            est = words / 5.5 + 1.0
+            end_wait = min(max(est, 5.0),
+                           getattr(config, "TTS_SPEAK_TIMEOUT", 90))
+            finished_ev.wait(timeout=end_wait)
+            done.wait(timeout=getattr(config, "TTS_END_WAIT_SECONDS", 1.5))
         ok = result["ok"] or result["spoke"]
         spoke = result["spoke"] or (ok and not can_detect["yes"])
         if ok and spoke:
             # Движок живой — отпускаем его сразу, не дожидаясь завершения
-            # внутреннего потока sapi5 (join стоил десяткам секунд паузы).
+            # внутреннего потока sapi5 (join стоил десятков секунд паузы).
             try:
                 engine.stop()
             except Exception:  # noqa: BLE001

@@ -1,5 +1,7 @@
 """Главный модуль голосового агента: статус, команды, главный цикл."""
 
+import logging
+import logging.handlers
 import os
 import sqlite3
 import sys
@@ -25,12 +27,12 @@ if __package__ in (None, ""):
     from app import config, llm, search, storage  # type: ignore[no-redef]
     from app.stt import SpeechToText  # type: ignore[no-redef]
     from app.tts import TextToSpeech  # type: ignore[no-redef]
-    from app.utils import log, parse_quoted_argument  # type: ignore[no-redef]
+    from app.utils import dbg, log, parse_quoted_argument  # type: ignore[no-redef]
 else:
     from . import config, llm, search, storage
     from .stt import SpeechToText
     from .tts import TextToSpeech
-    from .utils import log, parse_quoted_argument
+    from .utils import dbg, log, parse_quoted_argument
 
 
 HELP_TEXT = """
@@ -46,6 +48,10 @@ HELP_TEXT = """
   /reindex              — очистить базу знаний и заново проиндексировать knowledge
   /add <текст>          — сохранить ручную заметку
   /history [N]          — показать последние N записей диалога (по умолчанию 10)
+  /debug [вкл|выкл]     — подробный отладочный вывод: время каждого шага в консоли
+                          + DEBUG-строки в logs/app.log (видно, где именно зависание)
+  /prompt [вкл|выкл]    — показывать полный промпт (контекст базы знаний + историю),
+                          который уходит в модель LLM
   /exit, /quit, выход   — завершить работу
 
 Как пользоваться:
@@ -53,6 +59,8 @@ HELP_TEXT = """
   • Пустой Enter (или /voice) — запись вопроса с микрофона;
     во время записи напечатано «Слушаю...», пауза завершает фразу.
     Отключить авто-прослушивание по пустому Enter: VOICE_AUTO_LISTEN=False в config.py.
+  • Если start.bat «завис»: включите /debug и посмотрите последнюю строку
+    с отметкой времени — на ней и происходит блокировка.
   • Все данные остаются на этом компьютере.
 """
 
@@ -76,6 +84,8 @@ class VoiceAgentApp:
         print("=" * 60)
         print("Локальный голосовой агент «Voice Agent»")
         print("=" * 60)
+        dbg("Старт приложения (если строки ниже перестали появляться — "
+            "зависание на последнем шаге; подробности в logs/app.log)")
 
         # 1. Создать отсутствующие папки.
         for directory in (config.DATA_DIR, config.LOGS_DIR, config.KNOWLEDGE_DIR):
@@ -88,6 +98,7 @@ class VoiceAgentApp:
         log.info("Запуск приложения, корень проекта: %s", config.PROJECT_ROOT)
 
         # 3. SQLite.
+        dbg("Открытие базы данных SQLite...")
         try:
             self.conn = storage.get_connection()
             self.use_fts = storage.init_db(self.conn)
@@ -96,12 +107,17 @@ class VoiceAgentApp:
                   "Приложение продолжит работу в ограниченном режиме.")
             log.exception("Инициализация SQLite не удалась")
             self.conn = None
+        dbg(f"SQLite готова (FTS5: {self.use_fts})")
 
         # 4–5. Ollama (проверка с коротким таймаутом — не должна вешать старт).
         print("Проверка Ollama...")
+        dbg(f"TCP/HTTP-проверка {config.OLLAMA_BASE_URL} "
+            f"(таймаут {config.OLLAMA_PING_TIMEOUT_SECONDS}с)...")
         self.ollama_available = llm.check_ollama_available()
+        dbg(f"Ollama доступна: {self.ollama_available}")
         if self.ollama_available:
             self.model_available = llm.check_model_available()
+            dbg(f"Модель {config.OLLAMA_MODEL} найдена: {self.model_available}")
         if not self.ollama_available:
             print("Ollama не отвечает. Проверьте, что она запущена "
                   "(при необходимости выполните: ollama serve).")
@@ -115,20 +131,29 @@ class VoiceAgentApp:
         if self.ollama_available and self.model_available:
             print("Загрузка модели в память (первый запуск может занять "
                   "до минуты)...")
+            dbg("warmup_model(): первый запрос к LLM (загрузка весов в RAM)...")
             if llm.warmup_model():
                 print("Модель загружена, ответы будут приходить быстрее.")
+                dbg("Прогрев модели завершён успешно.")
+            else:
+                dbg("Прогрев модели не выполнен (не критично).")
 
         # 6. Vosk.
         if self.stt.vosk_available and self.stt.model_exists_on_disk():
+            dbg("Загрузка модели Vosk (может занять несколько секунд)...")
             self.stt.load_model()
+            dbg(f"Vosk model_loaded: {self.stt.model_loaded}")
         else:
             self.stt.print_missing_model_instructions()
 
         # 7. TTS.
         print("Инициализация синтеза речи...")
+        dbg("pyttsx3.init(driverName='sapi5')...")
         self.tts = TextToSpeech()
         if self.tts.available:
             print(f"Голос озвучки: {self.tts.voice_name or '(по умолчанию)'}")
+        dbg(f"TTS available: {self.tts.available}, "
+            f"голос: {self.tts.voice_id or '(не выбран)'}")
 
         # 8. Автоиндексация knowledge, если база пуста.
         if self.conn is not None:
@@ -140,10 +165,12 @@ class VoiceAgentApp:
                 )
                 if has_files and docs_count == 0:
                     print("Индексация папки knowledge...")
+                    dbg("index_directory(knowledge)...")
                     summary = search.index_directory(
                         self.conn, config.KNOWLEDGE_DIR, self.use_fts)
                     print(f"  Проиндексировано файлов: {summary['indexed']}, "
                           f"пропущено без изменений: {summary['skipped']}.")
+                    dbg(f"Индексация завершена: {summary}")
             except sqlite3.Error:
                 log.exception("Автоиндексация не удалась")
 
@@ -153,7 +180,10 @@ class VoiceAgentApp:
 
         # 10. Приветствие голосом.
         if self.tts and self.tts.available:
+            dbg("Приветственная озвучка...")
             self.tts.say("Голосовой агент готов к работе.")
+        dbg("Инициализация завершена, главный цикл запущен "
+            "(ожидаю ввода; пустой Enter = запись голоса).")
 
     # ------------------------------------------------------------------
     # Статус
@@ -202,19 +232,30 @@ class VoiceAgentApp:
 
         hits: list[search.SearchHit] = []
         if self.conn is not None:
+            dbg(f"Поиск по базе знаний: «{question[:80]}»...")
             try:
                 hits = search.search_docs(self.conn, question,
                                           limit=config.SEARCH_TOP_K,
                                           use_fts=self.use_fts)
             except sqlite3.Error:
                 log.exception("Ошибка поиска при обработке вопроса")
-
-        if hits:
-            print(f"Найдено фрагментов в базе знаний: {len(hits)}")
+        dbg(f"Найдено фрагментов: {len(hits)}")
 
         messages = llm.build_messages(question, hits, self.history)
+        if getattr(config, "DEBUG_SHOW_PROMPT", False) or \
+                os.environ.get("VA_DEBUG_PROMPT", "") == "1":
+            print("\n----- ПРОМПТ, ОТПРАВЛЕННЫЙ В МОДЕЛЬ -----")
+            for m in messages:
+                body = m["content"]
+                if len(body) > 1200:
+                    body = body[:1200] + " …(обрезано для показа)"
+                print(f"[{m['role']}]\n{body}\n")
+            print("-----------------------------------------\n")
 
         print("Ожидание ответа модели...")
+        dbg(f"POST {config.OLLAMA_BASE_URL}/api/chat "
+            f"(модель {config.OLLAMA_MODEL}, таймаут "
+            f"{config.LLM_TIMEOUT_SECONDS}с)...")
         started = time.monotonic()
         try:
             answer = llm.ask(messages)
@@ -222,6 +263,7 @@ class VoiceAgentApp:
             print(f"\n{exc}")
             return
         duration_ms = int((time.monotonic() - started) * 1000)
+        dbg(f"Ответ модели получен за {duration_ms / 1000:.2f}с")
 
         sources = [hit.source for hit in hits]
 
@@ -249,7 +291,9 @@ class VoiceAgentApp:
             self.history = self.history[-max_items:]
 
         if self.tts and self.tts.available:
+            dbg("Озвучка ответа...")
             self.tts.say(answer)
+            dbg("Озвучка завершена.")
 
     # ------------------------------------------------------------------
     # Команды (раздел 14 ТЗ)
@@ -290,9 +334,70 @@ class VoiceAgentApp:
             self._cmd_add(argument)
         elif command == "/history":
             self._cmd_history(argument)
+        elif command == "/debug":
+            self._cmd_debug(argument)
+        elif command == "/prompt":
+            self._cmd_prompt(argument)
         else:
             print(f"Неизвестная команда: {command}. Введите /help для списка команд.")
         return True
+
+    # ------------------------------------------------------------------
+    # Отладочные команды
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _toggle_flag(attr: str, argument: str) -> bool:
+        """Включает/выключает булев флаг config по аргументу вкл/выкл/on/off/toggle.
+
+        Возвращает новое значение флага.
+        """
+        current = bool(getattr(config, attr, False))
+        arg = (argument or "").strip().lower()
+        if arg in ("вкл", "on", "1", "true", "да"):
+            new_value = True
+        elif arg in ("выкл", "off", "0", "false", "нет"):
+            new_value = False
+        elif arg in ("", "toggle"):
+            new_value = not current
+        else:
+            print("Использование: без аргумента — переключить; "
+                  "«вкл»/«выкл» — задать явно.")
+            return current
+        setattr(config, attr, new_value)
+        return new_value
+
+    def _cmd_debug(self, argument: str) -> None:
+        new_value = self._toggle_flag("DEBUG_CONSOLE", argument)
+        logger = logging.getLogger("voice_agent")
+        if new_value:
+            logger.setLevel(logging.DEBUG)
+            if not any(isinstance(h, logging.StreamHandler) and
+                       not isinstance(h, logging.handlers.RotatingFileHandler)
+                       for h in logger.handlers):
+                console = logging.StreamHandler(sys.stderr)
+                console.setLevel(logging.DEBUG)
+                console.setFormatter(logging.Formatter(
+                    "[%(asctime)s][%(levelname)s] %(message)s", datefmt="%H:%M:%S"))
+                logger.addHandler(console)
+            print("Отладка ВКЛЮЧЕНА: каждый шаг с отметкой времени печатается "
+                  "в этом окне и пишется в logs/app.log (уровень DEBUG).\n"
+                  "Последняя напечатанная строка перед паузой = место зависания.")
+        else:
+            logger.setLevel(logging.INFO)
+            for h in list(logger.handlers):
+                if isinstance(h, logging.StreamHandler) and \
+                        not isinstance(h, logging.handlers.RotatingFileHandler):
+                    logger.removeHandler(h)
+                    h.close()
+            print("Отладка выключена (INFO-уровень, консоль чистая).")
+
+    def _cmd_prompt(self, argument: str) -> None:
+        new_value = self._toggle_flag("DEBUG_SHOW_PROMPT", argument)
+        print("Показ полного промпта для модели "
+              + ("ВКЛЮЧЁН: перед каждым ответом будет печататься текст, "
+                 "который реально уходит в LLM (системная инструкция, "
+                 "фрагменты базы знаний, история)."
+                 if new_value else "выключен."))
 
     def refresh_availability(self) -> None:
         """Повторно проверяет Ollama (для /status)."""

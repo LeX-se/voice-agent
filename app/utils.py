@@ -2,7 +2,10 @@
 
 import logging
 import logging.handlers
+import os
 import re
+import sys
+import time
 
 from . import config
 
@@ -11,11 +14,20 @@ from . import config
 # Логирование
 # ---------------------------------------------------------------------------
 def setup_logging() -> logging.Logger:
-    """Настраивает запись журнала в logs/app.log (rotating, 5 файлов по 2 МБ)."""
+    """Настраивает запись журнала в logs/app.log (rotating, 5 файлов по 2 МБ).
+
+    По умолчанию в файл пишутся INFO и выше. Если включена отладка
+    (DEBUG_CONSOLE в config.py или переменная окружения VA_DEBUG=1),
+    уровень понижается до DEBUG и сообщения дублируются в консоль —
+    так видно каждый шаг запуска и момент, на котором всё зависло.
+    """
     config.LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+    debug_on = bool(getattr(config, "DEBUG_CONSOLE", False)) or \
+        os.environ.get("VA_DEBUG", "") == "1"
+
     logger = logging.getLogger("voice_agent")
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.DEBUG if debug_on else logging.INFO)
 
     if not logger.handlers:
         handler = logging.handlers.RotatingFileHandler(
@@ -29,10 +41,41 @@ def setup_logging() -> logging.Logger:
         )
         logger.addHandler(handler)
 
+        if debug_on:
+            console = logging.StreamHandler(sys.stderr)
+            console.setLevel(logging.DEBUG)
+            console.setFormatter(logging.Formatter(
+                "[%(asctime)s][%(levelname)s] %(message)s",
+                datefmt="%H:%M:%S"))
+            logger.addHandler(console)
+
     return logger
 
 
 log = setup_logging()
+
+
+# ---------------------------------------------------------------------------
+# Отладочный вывод в консоль (шаги запуска с отметками времени)
+# ---------------------------------------------------------------------------
+_session_start = time.monotonic()
+
+
+def dbg_enabled() -> bool:
+    return bool(getattr(config, "DEBUG_CONSOLE", False)) or \
+        os.environ.get("VA_DEBUG", "") == "1"
+
+
+def dbg(message: str) -> None:
+    """Печатает строку вида «[+3.21с] <message>» прямо в консоль.
+
+    Сообщения идут сразу (flush), поэтому если приложение зависнет,
+    последняя напечатанная строка и будет точкой зависания.
+    """
+    log.debug(message)
+    if dbg_enabled():
+        elapsed = time.monotonic() - _session_start
+        print(f"[+{elapsed:6.2f}с] {message}", flush=True)
 
 
 # ---------------------------------------------------------------------------

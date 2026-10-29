@@ -188,7 +188,17 @@ class SpeechToText:
     @staticmethod
     def _report_mic_problem(exc: Exception) -> None:
         text = str(exc).lower()
-        if "in_use" in text or "busy" in text or "unavailable device" in text \
+        # Распознаём отказ Windows в доступе к микрофону (политика
+        # конфиденциальности): PortAudio отдаёт "Unanticipated host error"
+        # либо internal error с кодом доступа.
+        privacy_markers = ("unanticipated host error", "access is denied",
+                           "отказано в доступе", "hostapi error")
+        if any(m in text for m in privacy_markers):
+            print("Windows запрещает этому приложению доступ к микрофону.")
+            print("Исправление: «Параметры → Конфиденциальность и защита → "
+                  "Микрофон» → включите «Доступ с десктопных приложений». "
+                  "Обычно помогает также перезапуск окна start.bat.")
+        elif "in_use" in text or "busy" in text or "unavailable device" in text \
                 or "invalid device" in text:
             print("Микрофон недоступен или занят другим приложением.")
         else:
