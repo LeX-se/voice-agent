@@ -26,6 +26,11 @@ APP_LOG_PATH = LOGS_DIR / "app.log"
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "qwen2.5:3b"
 LLM_TIMEOUT_SECONDS = 300
+# Таймаут быстрой проверки доступности Ollama при запуске (/api/tags).
+# На Windows «висячий» localhost-сокет (зависший прокси или процесс)
+# может блокировать старт надолго — поэтому таймаут короткий.
+OLLAMA_PING_TIMEOUT_SECONDS = 2
+LLM_KEEPALIVE = "5m"   # как долго Ollama держит модель в RAM между запросами
 LLM_TEMPERATURE = 0.3
 
 # ---------------------------------------------------------------------------

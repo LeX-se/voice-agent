@@ -1,10 +1,28 @@
 """Работа с локальной моделью через Ollama API (только localhost)."""
 
+import socket
+
 import requests
 
 from . import config
 from .search import SearchHit
 from .utils import log
+
+
+def _no_proxy_session() -> requests.Session:
+    """Сессия, игнорирующая системные прокси.
+
+    На Windows переменные HTTP(S)_PROXY или реестровые настройки прокси
+    иногда направляют запросы к localhost через прокси-сервер, который
+    их «вешает» на таймауты операционной системы (минуты вместо секунд).
+    trust_env=False запрещает requests читать переменные окружения прокси.
+    """
+    session = requests.Session()
+    session.trust_env = False
+    return session
+
+
+session = _no_proxy_session()
 
 
 SYSTEM_PROMPT = (
@@ -23,10 +41,44 @@ class LlmError(Exception):
 # ---------------------------------------------------------------------------
 # Проверки доступности
 # ---------------------------------------------------------------------------
-def check_ollama_available() -> bool:
-    """Проверяет, отвечает ли Ollama (GET /api/tags)."""
+def _tcp_ping(host: str, port: int, timeout: float) -> bool:
+    """Быстрая проверка: принимает ли host:port TCP-соединение.
+
+    Не поднимает прокси и не ждёт HTTP-ответа — самый надёжный способ
+    убедиться, что Ollama вообще слушает порт.
+    """
     try:
-        response = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5)
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def check_ollama_available() -> bool:
+    """Проверяет, отвечает ли Ollama (TCP-пинг порта + GET /api/tags)."""
+    # «localhost» может резолвиться в ::1, а Ollama слушать только 127.0.0.1
+    # (или наоборот) — поэтому пингуем адрес напрямую с коротким таймаутом.
+    host = "127.0.0.1"
+    port = 11434
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(config.OLLAMA_BASE_URL)
+        if parsed.hostname in ("localhost", "127.0.0.1", "::1"):
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 11434
+    except ValueError:
+        pass
+    reachable = _tcp_ping("127.0.0.1", port, config.OLLAMA_PING_TIMEOUT_SECONDS) or (
+        host != "127.0.0.1" and _tcp_ping(host, port,
+                                          config.OLLAMA_PING_TIMEOUT_SECONDS))
+    if not reachable:
+        log.warning("Порт Ollama (%s:%s) не отвечает за %s с",
+                    host, port, config.OLLAMA_PING_TIMEOUT_SECONDS)
+        return False
+    # Быстрый HTTP-запрос без системных прокси (session.trust_env=False).
+    try:
+        response = session.get(f"{config.OLLAMA_BASE_URL}/api/tags",
+                               timeout=config.OLLAMA_PING_TIMEOUT_SECONDS)
         return response.status_code == 200
     except requests.RequestException as exc:
         log.warning("Ollama недоступна: %s", exc)
@@ -36,7 +88,8 @@ def check_ollama_available() -> bool:
 def check_model_available() -> bool:
     """Проверяет наличие нужной модели в списке моделей Ollama."""
     try:
-        response = requests.get(f"{config.OLLAMA_BASE_URL}/api/tags", timeout=5)
+        response = session.get(f"{config.OLLAMA_BASE_URL}/api/tags",
+                               timeout=config.OLLAMA_PING_TIMEOUT_SECONDS * 2)
         response.raise_for_status()
         models = response.json().get("models", [])
         names = [m.get("name", "") for m in models]
@@ -47,6 +100,34 @@ def check_model_available() -> bool:
         return False
     except (requests.RequestException, ValueError) as exc:
         log.warning("Не удалось получить список моделей: %s", exc)
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Прогрев модели
+# ---------------------------------------------------------------------------
+def warmup_model() -> bool:
+    """Загружает модель в память Ollama коротким запросом.
+
+    Первая загрузка gguf-модели с диска занимает десятки секунд; если не
+    делать прогрев, эту паузу пользователь видит при первом же вопросе как
+    «зависание». keepalive в payload удерживает модель загруженной между
+    запросами, поэтому последующие ответы приходят быстро.
+    Возвращает True, если прогрев прошёл успешно (ошибки не фатальны).
+    """
+    payload = {
+        "model": config.OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": "ок"}],
+        "stream": False,
+        "keepalive": config.LLM_KEEPALIVE,
+        "options": {"temperature": 0.0, "num_predict": 1},
+    }
+    try:
+        response = session.post(f"{config.OLLAMA_BASE_URL}/api/chat",
+                                json=payload, timeout=config.LLM_TIMEOUT_SECONDS)
+        return response.status_code == 200
+    except requests.RequestException as exc:
+        log.warning("Прогрев модели не выполнен: %s", exc)
         return False
 
 
@@ -90,11 +171,16 @@ def ask(messages: list[dict]) -> str:
         "model": config.OLLAMA_MODEL,
         "messages": messages,
         "stream": False,
+        # keepalive: Ollama держит модель в оперативной памяти между
+        # запросами. Без него после простоя каждый следующий вопрос
+        # начинается с повторной загрузки модели с диска — это и даёт
+        # задержку до 60-120 секунд, похожую на зависание интерфейса.
+        "keepalive": config.LLM_KEEPALIVE,
         "options": {"temperature": config.LLM_TEMPERATURE},
     }
 
     try:
-        response = requests.post(
+        response = session.post(
             f"{config.OLLAMA_BASE_URL}/api/chat",
             json=payload,
             timeout=config.LLM_TIMEOUT_SECONDS,

@@ -98,7 +98,7 @@ class VoiceAgentApp:
             log.exception("Инициализация SQLite не удалась")
             self.conn = None
 
-        # 4–5. Ollama.
+        # 4–5. Ollama (проверка с коротким таймаутом — не должна вешать старт).
         print("Проверка Ollama...")
         self.ollama_available = llm.check_ollama_available()
         if self.ollama_available:
@@ -109,6 +109,15 @@ class VoiceAgentApp:
         elif not self.model_available:
             print(f"Модель {config.OLLAMA_MODEL} не найдена. "
                   f"Выполните: ollama pull {config.OLLAMA_MODEL}")
+
+        # 5b. Прогрев модели: первая загрузка qwen2.5:3b в RAM занимает
+        # десятки секунд; делаем её сейчас и держим loaded через keepalive,
+        # чтобы ответы на вопросы приходили быстро.
+        if self.ollama_available and self.model_available:
+            print("Загрузка модели в память (первый запуск может занять "
+                  "до минуты)...")
+            if llm.warmup_model():
+                print("Модель загружена, ответы будут приходить быстрее.")
 
         # 6. Vosk.
         if self.stt.vosk_available and self.stt.model_exists_on_disk():
