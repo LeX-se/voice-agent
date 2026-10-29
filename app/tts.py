@@ -21,7 +21,134 @@ class TextToSpeech:
         self.used_default_voice = False
         self._init_error = ""
         self._pyttsx3 = None
+        # Флаг «движок сломан»: ставится после зависания/ошибки озвучки.
+        self._broken = False
         self._init_engine()
+
+    # ------------------------------------------------------------------
+    def _reset_engine(self) -> bool:
+        """Полностью пересоздаёт движок pyttsx3 (лечит баг issue #412).
+
+        Внутренний поток-обработчик sapi5 после первого runAndWait() может
+        «уснуть»: следующие say()/runAndWait() возвращаются мгновенно и молча
+        либо зависают навсегда. Надёжный обход — каждый раз создавать новый
+        движок. Возвращает True, если движок живой.
+        """
+        try:
+            if self.engine is not None:
+                try:
+                    self.engine.stop()
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        engines = getattr(self._pyttsx3, "_activeEngines", None) if self._pyttsx3 else None
+        if engines is not None:
+            try:
+                engines.clear()
+            except Exception:  # noqa: BLE001
+                pass
+        self.engine = None
+        try:
+            engine = self._pyttsx3.init(driverName="sapi5")
+            engine.getProperty("voice")
+            engine.setProperty("rate", config.TTS_RATE)
+            if self.voice_id:
+                try:
+                    engine.setProperty("voice", self.voice_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            self.engine = engine
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось пересоздать движок TTS: %s", self._com_error_text(exc))
+            return False
+
+    def _speak_once(self, speech_text: str) -> tuple[bool, bool]:
+        """Одна попытка озвучки через отдельный поток с таймаутом.
+
+        Возвращает (вызов_завершён_без_ошибки, было_реальное_произнесение).
+        Флаг «было произнесение» ставится коллбэком onStart движка SAPI —
+        он срабатывает только когда голос действительно заговорил, и потому
+        надёжно отличается от молчаливого возврата бага #412. Если коллбэк
+        недоступен (неожиданный pyttsx3), считаем озвучку успешной по факту
+        штатного завершения runAndWait().
+        """
+        import threading
+
+        timeout = getattr(config, "TTS_SPEAK_TIMEOUT", 90)
+        done = threading.Event()
+        result = {"ok": False, "spoke": False}
+        can_detect = {"yes": False}
+
+        engine = self.engine
+        for attempt_attr in ("connect", "tts.addObserver"):
+            try:
+                if attempt_attr == "connect":
+                    engine.connect("started", lambda name: result.__setitem__("spoke", True))
+                else:
+                    engine.tts.addObserver(
+                        "started", lambda name: result.__setitem__("spoke", True))
+                can_detect["yes"] = True
+                break
+            except Exception:  # noqa: BLE001
+                continue
+
+        def worker(text: str = speech_text, ev=done) -> None:
+            try:
+                engine.say(text)
+                engine.runAndWait()
+                result["ok"] = True
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Ошибка в потоке озвучки: %s", self._com_error_text(exc))
+            finally:
+                ev.set()
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        if not done.wait(timeout):
+            # Зависание: гасим движок, чтобы поток-«зомби» завершился.
+            try:
+                engine.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            thread.join(timeout=5)
+            return False, result["spoke"]
+        ok = result["ok"]
+        spoke = result["spoke"] or (ok and not can_detect["yes"])
+        return ok, spoke
+
+    def say(self, text: str) -> bool:
+        """Озвучивает текст (полный ответ при этом уже показан в консоли).
+
+        Каждый вызов использует свежий движок SAPI: это обходит известный баг
+        pyttsx3 #412, из-за которого второй и последующие runAndWait() в одном
+        процессе молча ничего не произносят (первая фраза «готов к работе»
+        звучит, а ответы — нет). Успех определяется по событию начала
+        реального произнесения (onStart), а не по времени возврата.
+        Возвращает True, если озвучка выполнена.
+        """
+        if not self.available or self._broken:
+            return False
+        speech_text = clean_for_speech(text, config.MAX_SPEECH_CHARS)
+        if not speech_text:
+            return False
+
+        for attempt in (1, 2):
+            if not self._reset_engine():
+                self._broken = True
+                return False
+            ok, spoke = self._speak_once(speech_text)
+            if ok and spoke:
+                return True
+            if ok:
+                log.warning("runAndWait() завершился без произнесания (баг pyttsx3 "
+                            "#412), попытка %d — пересоздаю движок.", attempt)
+            else:
+                log.warning("Озвучка зависла (попытка %d) — пересоздаю движок TTS.",
+                            attempt)
+        print("Не удалось озвучить ответ (печатная версия выше).")
+        return False
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -168,26 +295,6 @@ class TextToSpeech:
             self.voice_name = getattr(voice, "name", "") or voice.id
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось установить голос: %s", exc)
-
-    # ------------------------------------------------------------------
-    def say(self, text: str) -> bool:
-        """Озвучивает текст (полный ответ при этом уже показан в консоли).
-
-        Возвращает True, если озвучка выполнена.
-        """
-        if not self.available or self.engine is None:
-            return False
-        speech_text = clean_for_speech(text, config.MAX_SPEECH_CHARS)
-        if not speech_text:
-            return False
-        try:
-            self.engine.say(speech_text)
-            self.engine.runAndWait()
-            return True
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Ошибка озвучки: %s", exc)
-            print("Не удалось озвучить ответ (печатная версия выше).")
-            return False
 
     def list_voices(self) -> list[tuple[str, str]]:
         """Возвращает список голосов (имя, ID) для команды /voices."""

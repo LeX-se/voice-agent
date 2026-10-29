@@ -52,5 +52,6 @@ CHUNK_SIZE = 900
 CHUNK_OVERLAP = 80
 MAX_SNIPPET_CHARS = 700
 MAX_SPEECH_CHARS = 1200
+TTS_SPEAK_TIMEOUT = 90   # макс. секунд на одну озвучку; при зависании движок пересоздаётся
 MAX_INDEX_FILE_MB = 10
 HISTORY_MESSAGES = 6
