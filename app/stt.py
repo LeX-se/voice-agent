@@ -134,8 +134,8 @@ class SpeechToText:
                     if not speech_started:
                         waited_for_speech += block_seconds
                         if waited_for_speech >= config.STT_WAIT_FOR_SPEECH_SECONDS:
-                            print("Речь не обнаружена. Проверьте микрофон и повторите "
-                                  "команду /voice.")
+                            print("Речь не обнаружена. Если микрофон не нужен — наберите "
+                                  "вопрос текстом; для повтора голоса введите /voice.")
                             log.info("Ожидание речи превысило лимит")
                             return ""
 

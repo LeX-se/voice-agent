@@ -23,32 +23,69 @@ class TextToSpeech:
         self._pyttsx3 = None
         # Флаг «движок сломан»: ставится после зависания/ошибки озвучки.
         self._broken = False
+        # Подряд провалившихся озвучек (после восстановления обнуляется).
+        self._fail_streak = 0
         self._init_engine()
 
     # ------------------------------------------------------------------
-    def _reset_engine(self) -> bool:
-        """Полностью пересоздаёт движок pyttsx3 (лечит баг issue #412).
+    def _dispose_current_engine(self) -> None:
+        """Бросает текущий движок и отпускает ссылки, НЕ дожидаясь его потока.
 
-        Внутренний поток-обработчик sapi5 после первого runAndWait() может
-        «уснуть»: следующие say()/runAndWait() возвращаются мгновенно и молча
-        либо зависают навсегда. Надёжный обход — каждый раз создавать новый
-        движок. Возвращает True, если движок живой.
+        На некоторых системах «спящий» движок sapi5 после runAndWait() не
+        реагирует на stop(): попытка дождаться его внутреннего потока или
+        собрать объект заново блокирует вызывающий код на десятки секунд —
+        визуально это выглядит как зависание интерфейса между ответами.
+        Поэтому движок просто бросаем (с гарантированным потолком ожидания),
+        ссылки обнуляем, а кэш _activeEngines чистим — новый движок создаётся
+        уже без старого.
         """
+        import gc
+
+        engine = self.engine
+        self.engine = None
+        if engine is None:
+            return
+        join_s = float(getattr(config, "TTS_ZOMBIE_JOIN_SECONDS", 2))
         try:
-            if self.engine is not None:
-                try:
-                    self.engine.stop()
-                except Exception:  # noqa: BLE001
-                    pass
+            engine.stop()
         except Exception:  # noqa: BLE001
             pass
+        # Поток-«зомби» не должен блокировать нас: принудительно помечаем его
+        # остановленным и отпускаем ссылки, сборщик мусора закроет COM сам.
+        try:
+            proxy = getattr(engine, "proxy", None)
+            tts_iter = getattr(proxy, "_tts", None) if proxy is not None else None
+            for attr in ("_iterating", "_queue"):
+                obj = getattr(tts_iter, attr, None) if tts_iter is not None else None
+                if obj is not None:
+                    try:
+                        obj.set(False) if attr == "_iterating" else obj.queue.clear()
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+        del engine, tts_iter, proxy
         engines = getattr(self._pyttsx3, "_activeEngines", None) if self._pyttsx3 else None
         if engines is not None:
             try:
                 engines.clear()
             except Exception:  # noqa: BLE001
                 pass
-        self.engine = None
+        try:
+            gc.collect()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _reset_engine(self) -> bool:
+        """Создаёт свежий движок pyttsx3 (обход бага issue #412).
+
+        Внутренний поток-обработчик sapi5 после первого runAndWait() может
+        «уснуть»: следующие say()/runAndWait() возвращаются мгновенно и молча
+        либо зависают навсегда. Обход — каждый раз создавать новый движок;
+        старый выбрасывается без ожидания его потока (см. _dispose_current_engine).
+        Возвращает True, если движок живой.
+        """
+        self._dispose_current_engine()
         try:
             engine = self._pyttsx3.init(driverName="sapi5")
             engine.getProperty("voice")
@@ -73,6 +110,8 @@ class TextToSpeech:
         надёжно отличается от молчаливого возврата бага #412. Если коллбэк
         недоступен (неожиданный pyttsx3), считаем озвучку успешной по факту
         штатного завершения runAndWait().
+        ВАЖНО: при успехе движок НЕ пересоздаётся (это стоило десятков секунд
+        паузы между ответами); сброс движка делается только после неудачи.
         """
         import threading
 
@@ -112,20 +151,27 @@ class TextToSpeech:
                 engine.stop()
             except Exception:  # noqa: BLE001
                 pass
-            thread.join(timeout=5)
+            thread.join(timeout=getattr(config, "TTS_ZOMBIE_JOIN_SECONDS", 2))
             return False, result["spoke"]
         ok = result["ok"]
         spoke = result["spoke"] or (ok and not can_detect["yes"])
+        if ok and spoke:
+            # Движок живой — отпускаем его сразу, не дожидаясь завершения
+            # внутреннего потока sapi5 (join стоил десяткам секунд паузы).
+            try:
+                engine.stop()
+            except Exception:  # noqa: BLE001
+                pass
         return ok, spoke
 
     def say(self, text: str) -> bool:
         """Озвучивает текст (полный ответ при этом уже показан в консоли).
 
-        Каждый вызов использует свежий движок SAPI: это обходит известный баг
-        pyttsx3 #412, из-за которого второй и последующие runAndWait() в одном
-        процессе молча ничего не произносят (первая фраза «готов к работе»
-        звучит, а ответы — нет). Успех определяется по событию начала
-        реального произнесения (onStart), а не по времени возврата.
+        Экономим время между ответами: сначала пробуем текущий живой движок —
+        если он реально произносит фразу (событие started), возврат мгновенный.
+        Только при молчаливом возврате/зависании бага pyttsx3 #412 движок
+        пересоздаётся и делается вторая попытка. Успех определяется по событию
+        начала реального произнесения (onStart), а не по времени возврата.
         Возвращает True, если озвучка выполнена.
         """
         if not self.available or self._broken:
@@ -135,11 +181,16 @@ class TextToSpeech:
             return False
 
         for attempt in (1, 2):
-            if not self._reset_engine():
-                self._broken = True
-                return False
+            if attempt == 2 or self.engine is None:
+                # Первая попытка использует уже созданный движок; второй движок
+                # создаётся только после неудачи (это лечит баг #412 без
+                # лишней паузы на каждый ответ).
+                if not self._reset_engine():
+                    self._broken = True
+                    return False
             ok, spoke = self._speak_once(speech_text)
             if ok and spoke:
+                self._fail_streak = 0
                 return True
             if ok:
                 log.warning("runAndWait() завершился без произнесания (баг pyttsx3 "
@@ -147,6 +198,14 @@ class TextToSpeech:
             else:
                 log.warning("Озвучка зависла (попытка %d) — пересоздаю движок TTS.",
                             attempt)
+        # Зависания могут накапливать «зомби»-движки SAPI и тормозить систему:
+        # после двух неудачных фраз подряд отключаем озвучку до перезапуска.
+        self._fail_streak += 1
+        if self._fail_streak >= 2:
+            self._broken = True
+            log.warning("Озвучка отключена после %d неудач подряд "
+                        "(перезапустите приложение для повторной попытки).",
+                        self._fail_streak)
         print("Не удалось озвучить ответ (печатная версия выше).")
         return False
 

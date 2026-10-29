@@ -50,7 +50,10 @@ HELP_TEXT = """
 
 Как пользоваться:
   • Наберите вопрос и нажмите Enter — ответ придёт текстом и голосом.
-  • Просто нажмите Enter (пустая строка) или /voice — можно говорить.
+    Микрофон при этом НЕ включается: слушание начинается только по /voice.
+  • /voice — записать вопрос голосом (пауза завершает фразу).
+  • Пустой Enter: если в config.py VOICE_AUTO_LISTEN=True — запись голоса,
+    иначе — подсказка о командах (микрофон не включается).
   • Все данные остаются на этом компьютере.
 """
 
@@ -413,17 +416,23 @@ class VoiceAgentApp:
         while running:
             try:
                 print()
-                line = input("Нажмите Enter для записи голоса или введите текст/команду: ")
+                prompt_hint = ("Enter — голос, или текст/команда" if getattr(config, "VOICE_AUTO_LISTEN", False)
+                                 else "Введите текст/команду, /voice — голос")
+                line = input(prompt_hint + ": ")
             except (KeyboardInterrupt, EOFError):
                 print("\nДо свидания!")
                 break
 
             stripped = line.strip()
             if stripped == "":
-                # Пустая строка → голосовой ввод; пустой результат ничего не отправляет.
-                text = self.stt.listen()
-                if text:
-                    self.process_question(text)
+                if getattr(config, "VOICE_AUTO_LISTEN", False):
+                    # Старое поведение по ТЗ: пустой Enter = запись голоса.
+                    text = self.stt.listen()
+                    if text:
+                        self.process_question(text)
+                else:
+                    print("(Голосовой ввод включается командой /voice; "
+                          "наберите вопрос текстом или /help.)")
                 continue
 
             if stripped.lower() == "выход":

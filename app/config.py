@@ -53,5 +53,10 @@ CHUNK_OVERLAP = 80
 MAX_SNIPPET_CHARS = 700
 MAX_SPEECH_CHARS = 1200
 TTS_SPEAK_TIMEOUT = 90   # макс. секунд на одну озвучку; при зависании движок пересоздаётся
+TTS_ZOMBIE_JOIN_SECONDS = 2  # сколько секунд ждать «зombie»-поток озвучки; дольше — не ждём
+                             # (иначе интерфейс висит десятками секунд между ответами)
+VOICE_AUTO_LISTEN = False  # True: пустой Enter = запись голоса (как в ТЗ);
+                           # False (по умолчанию): голос включается только командой /voice —
+                           # защита от случайного прослушивания вместо ответа
 MAX_INDEX_FILE_MB = 10
 HISTORY_MESSAGES = 6
