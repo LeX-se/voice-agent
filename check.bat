@@ -78,6 +78,12 @@ call :check_file "app\utils.py"
 call :check_file "requirements.txt"
 call :check_file "start.bat"
 call :check_file "install.bat"
+call :check_file "tools\mic_check.py"
+call :check_file "tools\tts_check.py"
+call :check_file "tools\selftest_check.py"
+call :check_file "tools\ollama_check.py"
+call :check_file "tools\ollama_models.py"
+call :check_file "tools\log_tail.py"
 echo       Project files check done.
 
 rem ---------- [2] Python interpreter ----------
@@ -133,28 +139,13 @@ if defined RUN_PY goto :mic_run
 echo       SKIP: no python available.
 goto :mic_done
 :mic_run
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = @'
-import sounddevice as sd
-devs = list(sd.query_devices())
-ins = [x for x in devs if x['max_input_channels'] > 0]
-print('      Input devices:', len(ins))
-try:
-    default_in = int(sd.default.device[0])
-except Exception:
-    default_in = -1
-for i, x in enumerate(devs):
-    if x['max_input_channels'] > 0:
-        mark = '   <-- DEFAULT' if i == default_in else ''
-        name = x['name'].splitlines()[0]
-        print('        [%d] %s%s' % (i, name, mark))
-try:
-    sd.check_input_status()
-    print('      Windows microphone access: ALLOWED')
-except Exception:
-    print('      FAILED: Windows denies microphone access to desktop apps.')
-    print('      Fix: Settings - Privacy - Microphone - allow desktop apps.')
-'@; $f = Join-Path $env:TEMP 'va_mic_test.py'; [IO.File]::WriteAllText($f, $c); & '%RUN_PY%' -X utf8 $f; $rc = $LASTEXITCODE; Remove-Item $f -ErrorAction SilentlyContinue; exit $rc" 2>&1
-if errorlevel 1 echo       WARN: microphone test failed. See lines above.
+if not exist "%ROOT%\tools\mic_check.py" (
+    echo       FAILED: tools\mic_check.py is missing. Re-download the project files.
+    set /a FAILCOUNT+=1
+) else (
+    "%RUN_PY%" -X utf8 "%ROOT%\tools\mic_check.py" 2>&1
+    if errorlevel 1 echo       WARN: microphone test failed. See lines above.
+)
 :mic_done
 
 rem ---------- [5] Vosk model ----------
@@ -177,20 +168,30 @@ rem ---------- [6] Ollama service ----------
 echo.
 echo [6/10] Ollama service ^(http://localhost:11434^)...
 set "OLLAMA_OK="
-if defined RUN_PY (
-    "%RUN_PY%" -c "import requests;requests.get('http://localhost:11434/api/tags',timeout=3)" >nul 2>&1 && set "OLLAMA_OK=1"
-) else (
-    curl -s -o nul --max-time 3 http://localhost:11434/api/tags >nul 2>&1 && set "OLLAMA_OK=1"
-)
-if not defined OLLAMA_OK (
-    echo       FAILED: cannot reach Ollama at http://localhost:11434
-    echo       Fix: install Ollama from https://ollama.com/download and run: ollama pull qwen2.5:3b
-    echo       Check that the Ollama icon is present in the system tray.
-    set /a FAILCOUNT+=1
-    goto :summary
-)
+rem Use the application check itself: TCP ping first (fails instantly when the
+rem port is closed, bounded by a short timeout when something hangs), direct
+rem connection with proxy bypass - no multi-minute stalls like raw requests.get.
+if not defined RUN_PY goto :ollama_skip
+if not exist "%ROOT%\tools\ollama_check.py" goto :ollama_missing
+"%RUN_PY%" -X utf8 "%ROOT%\tools\ollama_check.py" >nul 2>&1 && set "OLLAMA_OK=1"
+if not defined OLLAMA_OK goto :ollama_fail
 echo       OK: Ollama is running. Models:
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ProgressPreference='SilentlyContinue'; try { $m = Invoke-RestMethod -Uri 'http://localhost:11434/api/tags' -TimeoutSec 3; $m.models | ForEach-Object { Write-Output ('        - ' + $_.name) } } catch { }" 2>nul
+"%RUN_PY%" -X utf8 "%ROOT%\tools\ollama_models.py" 2>&1
+goto :ollama_done
+:ollama_skip
+echo       SKIP: no python available.
+goto :ollama_done
+:ollama_missing
+echo       FAILED: tools\ollama_check.py is missing. Re-download the project files.
+set /a FAILCOUNT+=1
+goto :summary
+:ollama_fail
+echo       FAILED: cannot reach Ollama at http://localhost:11434
+echo       Fix: install Ollama from https://ollama.com/download and run: ollama pull qwen2.5:3b
+echo       Check that the Ollama icon is present in the system tray.
+set /a FAILCOUNT+=1
+goto :summary
+:ollama_done
 
 rem ---------- [7] TTS voices ----------
 echo.
@@ -199,20 +200,12 @@ if defined RUN_PY goto :tts_run
 echo       SKIP: no python available.
 goto :tts_done
 :tts_run
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = @'
-import sys, os
-sys.path.insert(0, os.environ['VA_ROOT'])
-from app.tts import TextToSpeech
-t = TextToSpeech()
-print('      TTS available:', t.available)
-print('      Voice:', t.voice_name or '(none)')
-voices = t.list_voices()
-print('      Voices in Windows:', len(voices))
-for n, i in voices[:10]:
-    print('        -', n)
-if not t.available and t.error:
-    print('      Reason:', t.error)
-'@; $f = Join-Path $env:TEMP 'va_tts_test.py'; [IO.File]::WriteAllText($f, $c); & '%RUN_PY%' -X utf8 $f; $rc = $LASTEXITCODE; Remove-Item $f -ErrorAction SilentlyContinue; exit $rc" 2>&1
+if not exist "%ROOT%\tools\tts_check.py" (
+    echo       FAILED: tools\tts_check.py is missing. Re-download the project files.
+    set /a FAILCOUNT+=1
+) else (
+    "%RUN_PY%" -X utf8 "%ROOT%\tools\tts_check.py" 2>&1
+)
 :tts_done
 
 rem ---------- [8] App self-test ----------
@@ -222,16 +215,12 @@ if defined RUN_PY goto :selftest_run
 echo       SKIP: no python available.
 goto :selftest_done
 :selftest_run
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$c = @'
-import sys, os
-sys.path.insert(0, os.environ['VA_ROOT'])
-from app import config, utils, storage, search, llm, tts
-print('      Imports OK')
-print('      DB path:', config.DB_PATH)
-print('      Log path:', config.APP_LOG_PATH)
-import app.main
-print('      main.py loads OK (direct-run fix active)')
-'@; $f = Join-Path $env:TEMP 'va_selftest.py'; [IO.File]::WriteAllText($f, $c); & '%RUN_PY%' -X utf8 $f; $rc = $LASTEXITCODE; Remove-Item $f -ErrorAction SilentlyContinue; exit $rc" 2>&1
+if not exist "%ROOT%\tools\selftest_check.py" (
+    echo       FAILED: tools\selftest_check.py is missing. Re-download the project files.
+    set /a FAILCOUNT+=1
+    goto :selftest_done
+)
+"%RUN_PY%" -X utf8 "%ROOT%\tools\selftest_check.py" 2>&1
 if errorlevel 1 (
     echo       FAILED: application modules cannot be imported. See lines above.
     set /a FAILCOUNT+=1
@@ -241,14 +230,23 @@ if errorlevel 1 (
 rem ---------- [9] Recent errors from log ----------
 echo.
 echo [9/10] Last errors from logs\app.log...
+if not defined RUN_PY goto :logtail_skip
+if not exist "%ROOT%\tools\log_tail.py" goto :logtail_skip
 if exist "%LOG_DIR%\app.log" (
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$t = @(Get-Content -LiteralPath '%LOG_DIR%\app.log' -Encoding UTF8 -Tail 200 -ErrorAction SilentlyContinue | Select-String -Pattern 'ERROR|Traceback|Exception' -Context 0,2 | Select-Object -Last 15 | ForEach-Object { $_.Line }); [IO.File]::WriteAllLines([Text.Encoding]::UTF8, '%TEMP%\va_log_tail.txt', $t)" >nul 2>&1
+    rem Pure-Python helper: always writes UTF-8 without BOM (PowerShell one-liners
+    rem added a BOM on old Windows and cmd redirection used the OEM code page -
+    rem both produced unreadable mojibake in the report).
+    "%RUN_PY%" -X utf8 "%ROOT%\tools\log_tail.py" "%LOG_DIR%\app.log" "%TEMP%\va_log_tail.txt" >nul 2>nul
     type "%TEMP%\va_log_tail.txt"
     del "%TEMP%\va_log_tail.txt" >nul 2>&1
     echo       Full log: %LOG_DIR%\app.log ^(UTF-8; if console shows mojibake, open the file in Notepad^)
-) else (
-    echo       No log file yet ^(app was never started successfully^).
+    goto :logtail_done
 )
+echo       No log file yet ^(app was never started successfully^).
+goto :logtail_done
+:logtail_skip
+echo       SKIP: cannot read the log without python/tools.
+:logtail_done
 
 rem ---------- [10] One-shot question test ----------
 echo.

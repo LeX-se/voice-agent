@@ -90,6 +90,18 @@ class SpeechToText:
                   "Подробности в журнале logs/app.log.")
             return ""
 
+        # Если микрофон не найден — сразу понятное сообщение вместо
+        # «тихого» ожидания, которое выглядит как зависание/постоянное слушание.
+        try:
+            inputs = [d for d in sd.query_devices() if d.get("max_input_channels", 0) > 0]
+        except Exception:  # noqa: BLE001
+            inputs = []
+        if not inputs:
+            print("Микрофон не найден. Наберите вопрос текстом и нажмите Enter; "
+                  "для повтора проверки голоса введите /voice.")
+            log.warning("Ни одного устройства записи не найдено")
+            return ""
+
         recognizer = KaldiRecognizer(self.model, config.STT_SAMPLE_RATE)
         samples_per_block = config.STT_BLOCK_SIZE  # int16-отсчётов на блок
 
@@ -101,7 +113,7 @@ class SpeechToText:
 
         block_seconds = samples_per_block / config.STT_SAMPLE_RATE
 
-        print("Говорите... (пауза завершает фразу)")
+        print("Слушаю... (говорите, пауза завершает фразу)")
         try:
             with sd.RawInputStream(
                 samplerate=config.STT_SAMPLE_RATE,
