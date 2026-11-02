@@ -292,21 +292,8 @@ class VoiceAgentApp:
 
         if self.tts and self.tts.available:
             dbg("Озвучка ответа...")
-            try:
-                self.tts.say(answer)
-            except Exception as exc:  # noqa: BLE001 — озвучка не должна ронять цикл
-                log.exception("Сбой озвучки ответа: %s", self._tts_error_text(exc))
-                print("Озвучка завернулась с ошибкой (печатная версия ответа выше).")
+            self.tts.say(answer)
             dbg("Озвучка завершена.")
-
-    @staticmethod
-    def _tts_error_text(exc: BaseException) -> str:
-        """Краткое человекочитаемое описание исключения из подсистемы TTS."""
-        try:
-            from .tts import TextToSpeech
-            return TextToSpeech._com_error_text(exc)
-        except Exception:  # noqa: BLE001
-            return str(exc)
 
     # ------------------------------------------------------------------
     # Команды (раздел 14 ТЗ)
@@ -437,8 +424,7 @@ class VoiceAgentApp:
         if self.tts is None or not self.tts.available:
             print("Синтез речи недоступен, озвучить текст нельзя.")
             return
-        if self.tts.say(text):
-            print("Озвучено.")
+        self.tts.say(text)
 
     def _require_db(self) -> bool:
         if self.conn is None:
