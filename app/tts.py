@@ -1,10 +1,27 @@
-"""Синтез речи через Windows SAPI5 (pyttsx3). Движок инициализируется один раз."""
+"""Синтез речи через Windows SAPI5 (pyttsx3).
+
+Стабильность озвучки (раздел 12.1 ТЗ):
+- движок инициализируется один раз; пересоздаётся только после реальной
+  неудачи (лечит баг pyttsx3 #412 без лишних пауз между ответами);
+- все озвучки сериализованы мьютексом (исключает «run loop already started»);
+- успех определяется по событию начала реального произнесения, конец фразы —
+  по событию окончания; фиксированных «grace»-пауз нет;
+- ожидание любого потока ограничено таймаутами из config, зависший движок
+  выбрасывается без блокировки интерфейса;
+- после серии неудач озвучка отключается до перезапуска, приложение
+  продолжает работать в текстовом режиме.
+"""
 
 import threading
 import time
 
 from . import config
 from .utils import clean_for_speech, log
+
+
+def _cfg(name: str, default):
+    """Константа из config с запасным значением (защита от старых конфигов)."""
+    return getattr(config, name, default)
 
 
 class TextToSpeech:
@@ -22,25 +39,35 @@ class TextToSpeech:
         self.used_default_voice = False
         self._init_error = ""
         self._pyttsx3 = None
-        # Флаг «движок сломан»: ставится после зависания/ошибки озвучки.
+        # Флаг «движок сломан»: ставится после серии зависаний/ошибок озвучки.
         self._broken = False
-        # Подряд провалившихся озвучек (после восстановления обнуляется).
+        # Подряд провалившихся озвучек (после успеха обнуляется).
         self._fail_streak = 0
         # Защита от параллельных озвучек (приводит к «run loop already started»).
         self._speak_lock = threading.Lock()
         self._init_engine()
 
     # ------------------------------------------------------------------
+    # Жизненный цикл движка
+    # ------------------------------------------------------------------
+    def _clear_engine_cache(self) -> None:
+        """Чистит глобальный weakref-кэш pyttsx3 (обход бага issue #398)."""
+        engines = getattr(self._pyttsx3, "_activeEngines", None) if self._pyttsx3 else None
+        if engines is not None:
+            try:
+                engines.clear()
+            except Exception:  # noqa: BLE001
+                pass
+
     def _dispose_current_engine(self) -> None:
-        """Бросает текущий движок и отпускает ссылки, НЕ дожидаясь его потока.
+        """Бросает текущий движок, НЕ дожидаясь его внутреннего потока.
 
         На некоторых системах «спящий» движок sapi5 после runAndWait() не
-        реагирует на stop(): попытка дождаться его внутреннего потока или
+        реагирует на stop(): попытка дождаться его потока или аккуратно
         собрать объект заново блокирует вызывающий код на десятки секунд —
         визуально это выглядит как зависание интерфейса между ответами.
-        Поэтому движок просто бросаем (с гарантированным потолком ожидания),
-        ссылки обнуляем, а кэш _activeEngines чистим — новый движок создаётся
-        уже без старого.
+        Поэтому движок просто бросаем, ссылки обнуляем, кэш _activeEngines
+        чистим — новый движок создаётся уже без старого.
         """
         import gc
 
@@ -48,7 +75,6 @@ class TextToSpeech:
         self.engine = None
         if engine is None:
             return
-        join_s = float(getattr(config, "TTS_ZOMBIE_JOIN_SECONDS", 2))
         try:
             engine.stop()
         except Exception:  # noqa: BLE001
@@ -56,26 +82,32 @@ class TextToSpeech:
         # Поток-«зомби» не должен блокировать нас: принудительно помечаем его
         # остановленным и отпускаем ссылки, сборщик мусора закроет COM сам.
         try:
-            proxy = getattr(engine, "proxy", None)
-            tts_iter = getattr(proxy, "_tts", None) if proxy is not None else None
-            for attr in ("_iterating", "_queue"):
-                obj = getattr(tts_iter, attr, None) if tts_iter is not None else None
-                if obj is not None:
+            driver = getattr(getattr(engine, "proxy", None), "_driver", None)
+            if driver is not None:
+                for attr, value in (("_looping", False), ("_speaking", False),
+                                    ("_stopping", True)):
                     try:
-                        obj.set(False) if attr == "_iterating" else obj.queue.clear()
+                        setattr(driver, attr, value)
                     except Exception:  # noqa: BLE001
                         pass
         except Exception:  # noqa: BLE001
             pass
-        del engine, tts_iter, proxy
-        engines = getattr(self._pyttsx3, "_activeEngines", None) if self._pyttsx3 else None
-        if engines is not None:
-            try:
-                engines.clear()
-            except Exception:  # noqa: BLE001
-                pass
+        del engine, driver
+        self._clear_engine_cache()
         try:
             gc.collect()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _configure_engine(self, engine) -> None:
+        """Применяет к движку голос и скорость речи."""
+        try:
+            if self.voice_id:
+                engine.setProperty("voice", self.voice_id)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            engine.setProperty("rate", config.TTS_RATE)
         except Exception:  # noqa: BLE001
             pass
 
@@ -84,31 +116,50 @@ class TextToSpeech:
 
         Внутренний поток-обработчик sapi5 после первого runAndWait() может
         «уснуть»: следующие say()/runAndWait() возвращаются мгновенно и молча
-        либо зависают навсегда. Обход — каждый раз создавать новый движок;
-        старый выбрасывается без ожидания его потока (см. _dispose_current_engine).
-        Возвращает True, если движок живой.
+        либо зависают навсегда. Обход — создать новый движок; старый
+        выбрасывается без ожидания его потока (см. _dispose_current_engine).
+        Возвращает True, если движок создан.
         """
         self._dispose_current_engine()
         try:
             engine = self._pyttsx3.init(driverName="sapi5")
-            engine.getProperty("voice")
-            engine.setProperty("rate", config.TTS_RATE)
-            if self.voice_id:
-                try:
-                    engine.setProperty("voice", self.voice_id)
-                except Exception:  # noqa: BLE001
-                    pass
+            engine.getProperty("voice")  # проверка живости COM
             self.engine = engine
+            self._configure_engine(engine)
             return True
         except Exception as exc:  # noqa: BLE001
             log.warning("Не удалось пересоздать движок TTS: %s", self._com_error_text(exc))
             return False
 
+    # ------------------------------------------------------------------
+    # Озвучка
+    # ------------------------------------------------------------------
+    def _connect_event(self, event: str, callback) -> bool:
+        """Регистрирует обработчик событий движка (started/completed).
+
+        Поддерживает оба механизма подписки разных версий pyttsx3:
+        public ``connect`` и прямой доступ к драйверу ``tts.addObserver``.
+        Возвращает True, если подписка удалась.
+        """
+        engine = self.engine
+        if engine is None:
+            return False
+        for register in (
+            lambda: engine.connect(event, callback),
+            lambda: engine.tts.addObserver(event, callback),
+        ):
+            try:
+                register()
+                return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
+
     def _speak_once(self, speech_text: str) -> tuple[bool, bool]:
-        """Одна попытка озвучки через отдельный поток с таймаутом.
+        """Одна попытка озвучки через отдельный поток с таймаутами.
 
         Возвращает (вызов_завершён_без_ошибки, было_реальное_произнесение).
-        Флаг «было произнесение» ставится коллбэком onStart движка SAPI —
+        Флаг «было произнесение» ставится коллбэком начала произнесения —
         он срабатывает только когда голос действительно заговорил, и потому
         надёжно отличается от молчаливого возврата бага #412. Если коллбэк
         недоступен (неожиданный pyttsx3), считаем озвучку успешной по факту
@@ -116,30 +167,35 @@ class TextToSpeech:
         ВАЖНО: при успехе движок НЕ пересоздаётся (это стоило десятков секунд
         паузы между ответами); сброс движка делается только после неудачи.
         """
-        import threading
+        timeout = _cfg("TTS_SPEAK_TIMEOUT", 90)
+        start_wait = _cfg("TTS_START_WAIT_SECONDS", 5)
+        end_wait_limit = _cfg("TTS_END_WAIT_SECONDS", 1.5)
+        zombie_join = _cfg("TTS_ZOMBIE_JOIN_SECONDS", 2)
 
-        timeout = getattr(config, "TTS_SPEAK_TIMEOUT", 90)
-        done = threading.Event()
+        done = threading.Event()          # worker завершился
+        spoke_ev = threading.Event()      # начало реального произнесения
+        finished_ev = threading.Event()   # окончание произнесения (completed)
         result = {"ok": False, "spoke": False}
-        can_detect = {"yes": False}
 
         engine = self.engine
-        for attempt_attr in ("connect", "tts.addObserver"):
-            try:
-                if attempt_attr == "connect":
-                    engine.connect("started", lambda name: result.__setitem__("spoke", True))
-                else:
-                    engine.tts.addObserver(
-                        "started", lambda name: result.__setitem__("spoke", True))
-                can_detect["yes"] = True
-                break
-            except Exception:  # noqa: BLE001
-                continue
 
-        def worker(text: str = speech_text, ev=done, spoke=None,
-                   finished=None) -> None:
+        def on_started(*_args, **_kwargs) -> None:
+            result["spoke"] = True
+            spoke_ev.set()
+
+        def on_completed(*_args, **_kwargs) -> None:
+            finished_ev.set()
+
+        can_detect = self._connect_event("started", on_started)
+        if can_detect:
+            # Событие окончания фразы нужно, чтобы не «спать» вслепую:
+            # при баге #412 runAndWait() возвращается мгновенно, хотя голос
+            # ещё говорит, а при нормальном движке возврат сам означает конец.
+            self._connect_event("completed", on_completed)
+
+        def worker() -> None:
             try:
-                engine.say(text)
+                engine.say(speech_text)
                 engine.runAndWait()
                 result["ok"] = True
             except Exception as exc:  # noqa: BLE001
@@ -148,66 +204,27 @@ class TextToSpeech:
                 # подтвердит произнесение.
                 log.debug("Исключение в потоке озвучки (обрабатывается): %s",
                           self._com_error_text(exc))
-            # При баге #412 runAndWait() возвращается мгновенно, хотя движок
-            # ещё говорит. Не даём потоку завершиться раньше реального
-            # окончания произнесения: ждём событие started, затем событие
-            # completed от SAPI (штатный признак конца фразы). Оценка по
-            # числу слов — только запасной путь, если completed не приходит;
-            # она ограничена сверху, чтобы не «спать» десятками секунд.
-            if spoke is not None and finished is not None:
-                spoke.wait(timeout=getattr(config, "TTS_SPEAK_TIMEOUT", 90))
-                words = max(len(text.split()), 1)
-                est = words / 5.5 + 1.0
-                if not finished.is_set():
-                    finished.wait(timeout=min(est, getattr(config, "TTS_SPEAK_FINISH_GRACE", 120)))
-            ev.set()
+            finally:
+                done.set()
 
-        spoke_ev = threading.Event()
-        finished_ev = threading.Event()
-        if can_detect["yes"]:
-            def on_started(name=None, _ev=spoke_ev) -> None:
-                result["spoke"] = True
-                _ev.set()
-            # pyttsx3 генерирует событие 'completed' по окончании фразы —
-            # регистрируем сразу, чтобы worker мог дождаться реального конца.
-            def on_completed(_name=None, _f=finished_ev) -> None:
-                _f.set()
-            for ev_name, cb in (("started", on_started), ("completed", on_completed)):
-                for attempt_attr in ("connect", "tts.addObserver"):
-                    try:
-                        if attempt_attr == "connect":
-                            engine.connect(ev_name, cb)
-                        else:
-                            engine.tts.addObserver(ev_name, cb)
-                        break
-                    except Exception:  # noqa: BLE001
-                        continue
-            for attempt_attr in ("connect", "tts.addObserver"):
-                try:
-                    if attempt_attr == "connect":
-                        engine.connect("started", on_started)
-                    else:
-                        engine.tts.addObserver("started", on_started)
-                    break
-                except Exception:  # noqa: BLE001
-                    continue
-
-        thread = threading.Thread(
-            target=worker, daemon=True,
-            kwargs={"spoke": spoke_ev, "finished": finished_ev}
-            if can_detect["yes"] else {})
+        thread = threading.Thread(target=worker, daemon=True)
         thread.start()
+
+        deadline = time.monotonic() + timeout
 
         # Ждём ЛИБО фактического начала произнесения (событие started —
         # достоверный признак успеха), либо штатного завершения потока.
-
-        deadline = time.monotonic() + timeout
+        # Окно ожидания старта ограничено start_wait: за это время живой SAPI
+        # обязательно успевает послать событие начала; если задержка больше —
+        # сработает общий дедлайн timeout.
+        start_deadline = time.monotonic() + min(start_wait, timeout)
         while not done.is_set() and not spoke_ev.is_set():
-            remaining = deadline - time.monotonic()
+            remaining = start_deadline - time.monotonic()
             if remaining <= 0:
                 break
             done.wait(min(remaining, 0.1))
-            spoke_ev.wait(0.05)
+            if spoke_ev.wait(0.05):
+                break
 
         if not done.is_set() and not spoke_ev.is_set():
             # Зависание без звука: гасим движок, чтобы поток-«зомби» завершился.
@@ -215,33 +232,35 @@ class TextToSpeech:
                 engine.stop()
             except Exception:  # noqa: BLE001
                 pass
-            thread.join(timeout=getattr(config, "TTS_ZOMBIE_JOIN_SECONDS", 2))
+            thread.join(timeout=zombie_join)
             return False, result["spoke"]
 
-        # Поток завершился, а события started не было: даём короткое окно на
+        # Поток завершился, а события started ещё нет: даём короткое окно на
         # «опоздавший» коллбэк (на реальных системах он приходит с задержкой).
-        if not spoke_ev.is_set() and can_detect["yes"]:
+        if not spoke_ev.is_set() and can_detect:
             spoke_ev.wait(0.3)
 
-        # Голос заговорил: ждём окончания РЕАЛЬНОГО произнесения по событию
-        # 'completed' движка SAPI (а не по оценке длительности текста).
-        # Фиксированное ожидание до TTS_SPEAK_FINISH_GRACE секунд — именно оно
-        # создавало паузы 60–120 с между ответами: worker после бага #412
-        # возвращался мгновенно, но «дожидаться конца фразы» он умел только
-        # вслепую. Теперь: completed → возврат сразу; нет completed (движок
-        # не прислал событие) → короткое окно TTS_END_WAIT_SECONDS.
+        # Голос заговорил, а поток ещё не вернулся (баг #412: runAndWait()
+        # «не замечает» окончания) — ждём реальное окончание произнесения по
+        # событию completed, затем короткое окно на возврат потока.
+        # Фиксированных длинных пауз нет: completed → возврат сразу.
         if result["spoke"] and not done.is_set():
             words = max(len(speech_text.split()), 1)
-            est = words / 5.5 + 1.0
-            end_wait = min(max(est, 5.0),
-                           getattr(config, "TTS_SPEAK_TIMEOUT", 90))
-            finished_ev.wait(timeout=end_wait)
-            done.wait(timeout=getattr(config, "TTS_END_WAIT_SECONDS", 1.5))
+            est = min(words / 5.5 + 1.0, timeout)  # страховка: оценка длины фразы
+            end_deadline = time.monotonic() + max(start_wait, est)
+            while not finished_ev.is_set() and not done.is_set():
+                remaining = end_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                finished_ev.wait(min(remaining, 0.25))
+            done.wait(timeout=end_wait_limit)
+
         ok = result["ok"] or result["spoke"]
-        spoke = result["spoke"] or (ok and not can_detect["yes"])
+        spoke = result["spoke"] or (ok and not can_detect)
         if ok and spoke:
-            # Движок живой — отпускаем его сразу, не дожидаясь завершения
-            # внутреннего потока sapi5 (join стоил десятков секунд паузы).
+            # Движок живой и отработал — останавливаем очередь сразу, не
+            # дожидаясь завершения внутреннего потока sapi5 (join стоил
+            # десятков секунд паузы между ответами).
             try:
                 engine.stop()
             except Exception:  # noqa: BLE001
@@ -255,7 +274,7 @@ class TextToSpeech:
         если он реально произносит фразу (событие started), возврат мгновенный.
         Только при молчаливом возврате/зависании бага pyttsx3 #412 движок
         пересоздаётся и делается вторая попытка. Успех определяется по событию
-        начала реального произнесения (onStart), а не по времени возврата.
+        начала реального произнесения, а не по времени возврата.
         Возвращает True, если озвучка выполнена.
         """
         if not self.available or self._broken:
@@ -264,11 +283,12 @@ class TextToSpeech:
         if not speech_text:
             return False
 
+        attempts = int(_cfg("TTS_MAX_RECOVERY_PER_PHRASE", 2))
         # Последовательные озвучки: параллельный запуск двух фраз через один
         # движок вызывает «run loop already started» и лишние пересоздания.
         with self._speak_lock:
-            for attempt in (1, 2):
-                if attempt == 2 or self.engine is None:
+            for attempt in range(1, max(attempts, 1) + 1):
+                if attempt > 1 or self.engine is None:
                     # Первая попытка использует уже созданный движок; новый
                     # движок создаётся только после реальной неудачи (это
                     # лечит баг #412 без лишней паузы на каждый ответ).
@@ -290,10 +310,11 @@ class TextToSpeech:
                     log.warning("Озвучка не состоялась (попытка %d) — "
                                 "пересоздаю движок TTS.", attempt)
             # Зависания могут накапливать «зомби»-движки SAPI и тормозить
-            # систему: после двух неудачных фраз подряд отключаем озвучку
+            # систему: после серии неудачных фраз подряд отключаем озвучку
             # до перезапуска.
             self._fail_streak += 1
-            if self._fail_streak >= 2:
+            broken_after = int(_cfg("TTS_MAX_BROKEN_STREAK", 2))
+            if self._fail_streak >= broken_after:
                 self._broken = True
                 log.warning("Озвучка отключена после %d неудач подряд "
                             "(перезапустите приложение для повторной попытки).",
@@ -301,6 +322,8 @@ class TextToSpeech:
             print("Не удалось озвучить ответ (печатная версия выше).")
             return False
 
+    # ------------------------------------------------------------------
+    # Диагностика и инициализация
     # ------------------------------------------------------------------
     @staticmethod
     def _com_error_text(exc: BaseException) -> str:
@@ -345,19 +368,14 @@ class TextToSpeech:
                 # _activeEngines при повторных init() в одном процессе иногда
                 # содержит нерабочую ссылку -> KeyError/COMError. Чистим кэш
                 # перед каждой попыткой.
-                engines = getattr(pyttsx3, "_activeEngines", None)
-                if engines is not None:
-                    try:
-                        engines.clear()
-                    except Exception:  # noqa: BLE001
-                        pass
+                self._pyttsx3 = pyttsx3
+                self._clear_engine_cache()
                 engine = pyttsx3.init(driverName="sapi5")
                 # Проверка работоспособности движка: getProperty("voice") бросает
                 # COMError (-2147201006), если SAPI не может выбрать голос.
                 engine.getProperty("voice")
-                engine.setProperty("rate", config.TTS_RATE)
-                self._pyttsx3 = pyttsx3
                 self.engine = engine
+                self._configure_engine(engine)
                 self._select_voice()
                 self.available = True
                 return
@@ -365,6 +383,7 @@ class TextToSpeech:
                 last_exc = exc
                 log.warning("Попытка %d: инициализация TTS не удалась: %s",
                             attempt + 1, self._com_error_text(exc))
+                self._dispose_current_engine()
                 # Если причина — отсутствие установленного голоса (hr 0x80040212),
                 # повторные попытки бессмысленны: выходим сразу с понятной подсказкой.
                 if self._looks_like_no_voices(exc):
@@ -393,6 +412,8 @@ class TextToSpeech:
         return "0x80040212" in text or "-2147201006" in text
 
     # ------------------------------------------------------------------
+    # Голоса
+    # ------------------------------------------------------------------
     def _iter_voices(self) -> list:
         if self.engine is None:
             return []
@@ -418,11 +439,12 @@ class TextToSpeech:
             except Exception:  # noqa: BLE001
                 return ""
 
-        priorities = ["maxim", "ivona", "russian", "ru-"]
-        for hint in priorities:
+        hint = (getattr(config, "TTS_VOICE_HINT", "") or "").lower()
+        priorities = [p for p in (hint, "maxim", "ivona", "russian", "ru-") if p]
+        for prio in dict.fromkeys(priorities):
             for voice in voices:
                 haystack = (name_of(voice) + " " + id_of(voice)).lower()
-                if hint in haystack:
+                if prio in haystack:
                     self._apply_voice(voice)
                     log.info("Выбран голос TTS: %s (%s)", name_of(voice), id_of(voice))
                     return
@@ -444,6 +466,9 @@ class TextToSpeech:
             self.engine.setProperty("voice", voice.id)
             self.voice_id = voice.id
             self.voice_name = getattr(voice, "name", "") or voice.id
+            # Порядок важен: rate применяется ПОСЛЕ выбора голоса (скорость
+            # хранится относительно конкретного голоса).
+            self.engine.setProperty("rate", config.TTS_RATE)
         except Exception as exc:  # noqa: BLE001
             log.exception("Не удалось установить голос: %s", exc)
 
